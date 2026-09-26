@@ -33,6 +33,16 @@ import UniformTypeIdentifiers
 import Core
 import SDWebImageSVGCoder
 
+extension NSApplication {
+    /// Whether the key window's text field holds uncommitted IME text (e.g. Japanese kana awaiting
+    /// conversion). SwiftUI's `.onKeyPress` sees ⏎ / ⎋ / arrows before the input method does, so
+    /// every popup key handler returns `.ignored` while this is true and lets the IME confirm,
+    /// cancel or pick a candidate instead of pasting, closing or moving the selection.
+    var isComposingMarkedText: Bool {
+        (keyWindow?.firstResponder as? NSTextInputClient)?.hasMarkedText() ?? false
+    }
+}
+
 private struct FilePreviewMetadata {
     var image: NSImage?
     var icon: NSImage?
@@ -231,6 +241,7 @@ public struct ResultCardView: View {
             refreshDiff()
         }
         .onKeyPress(.escape) {
+            if NSApp.isComposingMarkedText { return .ignored }
             handleEscape()
             return .handled
         }
@@ -252,6 +263,8 @@ public struct ResultCardView: View {
             return .handled
         }
         .onKeyPress(.return, phases: .down) { press in
+            // ⏎ confirming an IME conversion in the follow-up field is not a card command.
+            if NSApp.isComposingMarkedText { return .ignored }
             if payload.file != nil {
                 (onSave ?? onPaste)()
                 return .handled
@@ -915,6 +928,7 @@ public struct ResultCardView: View {
             // and with it the Esc that cancels. ⏎ is a no-op meanwhile (`followUpReturn`), so
             // anything typed simply waits for the next follow-up.
             .onKeyPress(.escape) {
+                if NSApp.isComposingMarkedText { return .ignored }
                 handleEscape()
                 return .handled
             }

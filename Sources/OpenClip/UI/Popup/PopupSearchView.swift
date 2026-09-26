@@ -327,6 +327,8 @@ public struct PopupSearchView: View {
             .focused($isFocused)
             .onSubmit { runSelected(replace: NSEvent.modifierFlags.contains(.shift)) }
             .onKeyPress { press in
+                // Mid-conversion keys belong to the input method (confirm, cancel, candidates).
+                if NSApp.isComposingMarkedText { return .ignored }
                 if press.key == .escape {
                     exitSearch()
                     return .handled
