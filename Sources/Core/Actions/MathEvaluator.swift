@@ -1,19 +1,24 @@
 // MathEvaluator.swift
 // OpenClip
 //
-// Deterministic, exception-free evaluator for simple arithmetic expressions used by
-// CalculateAction. Replaces NSExpression(format:), which throws an uncaught Objective-C
-// exception on malformed input (bare operators, unbalanced parens, invalid numbers) and crashes
-// the app. Returns nil for anything that isn't well-formed; never traps.
+// Deterministic, exception-free evaluator for CalculateAction. NSExpression(format:) raises an
+// uncaught Objective-C exception on malformed input, so this returns nil for anything malformed instead.
 import Foundation
 
 enum MathEvaluator {
+    /// Recursion cap. Only nested parens, repeated unary signs and right-associative powers count;
+    /// deeper input would overflow 512 KB secondary-thread stacks (issue #50).
+    private static let maxDepth = 32
+
     static func evaluate(_ input: String) -> Double? {
         var tokens = tokenize(input)
         guard !tokens.isEmpty else { return nil }
         var pos = 0
-        guard let value = parseExpression(tokens: &tokens, pos: &pos) else { return nil }
-        return pos == tokens.count ? value : nil
+        // A non-finite result is a failure, not a value: CalculateAction would emit "" and delete the selection (issue #50).
+        guard let value = parseExpression(tokens: &tokens, pos: &pos, depth: 0),
+              pos == tokens.count,
+              value.isFinite else { return nil }
+        return value
     }
 
     // MARK: - Tokens
@@ -24,8 +29,7 @@ enum MathEvaluator {
         case leftParen, rightParen
     }
 
-    /// Splits an already-validated arithmetic string into tokens. Returns an empty array for any
-    /// character outside the number/operator/paren alphabet, so callers treat it as "not calculable".
+    /// Tokenizes the input; returns [] for any character outside the number/operator/paren alphabet.
     private static func tokenize(_ input: String) -> [Token] {
         let chars = Array(input)
         var result: [Token] = []
@@ -93,23 +97,25 @@ enum MathEvaluator {
     //   power   := primary ('^' unary)?
     //   primary := (number | '(' expr ')') ('%')?
     //
-    // '^' is right-associative (2^3^2 = 2^(3^2) = 512) via the recursive power rule, and unary
-    // sign binds looser than '^' (Python's u_expr/power split): -2^2 = -(2^2) = -4, while the
-    // exponent itself may carry a sign (2^-2 = 0.25).
+    // '^' is right-associative (2^3^2 = 512); unary sign binds looser than '^' (-2^2 = -4);
+    // the exponent may carry a sign (2^-2 = 0.25).
 
-    private static func parseExpression(tokens: inout [Token], pos: inout Int) -> Double? {
-        guard let term = parseTerm(tokens: &tokens, pos: &pos) else { return nil }
+    private static func parseExpression(tokens: inout [Token], pos: inout Int, depth: Int) -> Double? {
+        guard depth <= maxDepth,
+              let term = parseTerm(tokens: &tokens, pos: &pos, depth: depth) else { return nil }
         var value = term
         while pos < tokens.count {
             switch tokens[pos] {
             case .plus:
                 pos += 1
-                guard let rhs = parseTerm(tokens: &tokens, pos: &pos) else { return nil }
+                guard let rhs = parseTerm(tokens: &tokens, pos: &pos, depth: depth) else { return nil }
                 value += rhs
+                guard value.isFinite else { return nil }
             case .minus:
                 pos += 1
-                guard let rhs = parseTerm(tokens: &tokens, pos: &pos) else { return nil }
+                guard let rhs = parseTerm(tokens: &tokens, pos: &pos, depth: depth) else { return nil }
                 value -= rhs
+                guard value.isFinite else { return nil }
             default:
                 return value
             }
@@ -117,25 +123,29 @@ enum MathEvaluator {
         return value
     }
 
-    private static func parseTerm(tokens: inout [Token], pos: inout Int) -> Double? {
-        guard let p = parseUnary(tokens: &tokens, pos: &pos) else { return nil }
+    private static func parseTerm(tokens: inout [Token], pos: inout Int, depth: Int) -> Double? {
+        guard depth <= maxDepth,
+              let p = parseUnary(tokens: &tokens, pos: &pos, depth: depth) else { return nil }
         var value = p
         while pos < tokens.count {
             switch tokens[pos] {
             case .times:
                 pos += 1
-                guard let rhs = parseUnary(tokens: &tokens, pos: &pos) else { return nil }
+                guard let rhs = parseUnary(tokens: &tokens, pos: &pos, depth: depth) else { return nil }
                 value *= rhs
+                guard value.isFinite else { return nil }
             case .divide:
                 pos += 1
-                guard let rhs = parseUnary(tokens: &tokens, pos: &pos) else { return nil }
+                guard let rhs = parseUnary(tokens: &tokens, pos: &pos, depth: depth) else { return nil }
                 guard rhs != 0 else { return nil }
                 value /= rhs
+                guard value.isFinite else { return nil }
             case .mod:
                 pos += 1
-                guard let rhs = parseUnary(tokens: &tokens, pos: &pos) else { return nil }
+                guard let rhs = parseUnary(tokens: &tokens, pos: &pos, depth: depth) else { return nil }
                 guard rhs != 0 else { return nil }
                 value = value.truncatingRemainder(dividingBy: rhs)
+                guard value.isFinite else { return nil }
             default:
                 return value
             }
@@ -143,33 +153,34 @@ enum MathEvaluator {
         return value
     }
 
-    private static func parseUnary(tokens: inout [Token], pos: inout Int) -> Double? {
-        guard pos < tokens.count else { return nil }
+    private static func parseUnary(tokens: inout [Token], pos: inout Int, depth: Int) -> Double? {
+        guard depth <= maxDepth, pos < tokens.count else { return nil }
         switch tokens[pos] {
         case .minus:
             pos += 1
-            guard let operand = parseUnary(tokens: &tokens, pos: &pos) else { return nil }
+            guard let operand = parseUnary(tokens: &tokens, pos: &pos, depth: depth + 1) else { return nil }
             return -operand
         case .plus:
             pos += 1
-            return parseUnary(tokens: &tokens, pos: &pos)
+            return parseUnary(tokens: &tokens, pos: &pos, depth: depth + 1)
         default:
-            return parsePower(tokens: &tokens, pos: &pos)
+            return parsePower(tokens: &tokens, pos: &pos, depth: depth)
         }
     }
 
-    private static func parsePower(tokens: inout [Token], pos: inout Int) -> Double? {
-        guard let base = parsePrimary(tokens: &tokens, pos: &pos) else { return nil }
+    private static func parsePower(tokens: inout [Token], pos: inout Int, depth: Int) -> Double? {
+        guard depth <= maxDepth,
+              let base = parsePrimary(tokens: &tokens, pos: &pos, depth: depth) else { return nil }
         guard pos < tokens.count, tokens[pos] == .power else { return base }
         pos += 1
-        guard let exponent = parseUnary(tokens: &tokens, pos: &pos) else { return nil }
+        guard let exponent = parseUnary(tokens: &tokens, pos: &pos, depth: depth + 1) else { return nil }
         let res = pow(base, exponent)
-        guard !res.isNaN && !res.isInfinite else { return nil }
+        guard res.isFinite else { return nil }
         return res
     }
 
-    private static func parsePrimary(tokens: inout [Token], pos: inout Int) -> Double? {
-        guard pos < tokens.count else { return nil }
+    private static func parsePrimary(tokens: inout [Token], pos: inout Int, depth: Int) -> Double? {
+        guard depth <= maxDepth, pos < tokens.count else { return nil }
         var value: Double
         switch tokens[pos] {
         case .number(let number):
@@ -177,7 +188,7 @@ enum MathEvaluator {
             value = number
         case .leftParen:
             pos += 1
-            guard let inner = parseExpression(tokens: &tokens, pos: &pos) else { return nil }
+            guard let inner = parseExpression(tokens: &tokens, pos: &pos, depth: depth + 1) else { return nil }
             guard pos < tokens.count, case .rightParen = tokens[pos] else { return nil }
             pos += 1
             value = inner

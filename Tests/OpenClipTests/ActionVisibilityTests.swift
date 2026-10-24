@@ -2,13 +2,14 @@ import XCTest
 @testable import Core
 
 private extension ActionContext {
-    init(selectedText: String, bundleID: String? = "com.test.app") {
+    init(selectedText: String, bundleID: String? = "com.test.app", source: SelectionSource = .selection) {
         let selection = SelectionContext(
             text: selectedText,
             sourceApp: AppIdentity(bundleIdentifier: bundleID, localizedName: "TestApp"),
             cursorPosition: .zero,
             timestamp: Date(),
-            appPolicy: .default
+            appPolicy: .default,
+            source: source
         )
         self.init(selection: selection, modifiers: [])
     }
@@ -16,11 +17,6 @@ private extension ActionContext {
 
 @MainActor
 final class ActionVisibilityTests: XCTestCase {
-    private func attemptParse(_ source: String) -> ValidateExpression {
-        // Test-only: source strings here are known-valid; parse failure would surface as a force-trap.
-        try! ValidateExpression.parse(source).get()
-    }
-
     // MARK: - App allow / deny lists
 
     func testAllowListEnablesWhenBundleIdentifierMatches() {
@@ -86,14 +82,112 @@ final class ActionVisibilityTests: XCTestCase {
         XCTAssertTrue(result.enabled)
     }
 
-    func testDecodedRequirementsExpressionSurvivesRoundTrip() throws {
-        let json = #"{"expression": "isEmail(text)"}"#.data(using: .utf8)!
-        let requirements = try JSONDecoder().decode(ActionRequirements.self, from: json)
-        XCTAssertEqual(requirements.expression, "isEmail(text)")
+    func testRequiresSelectionTreatsOCRAsNonblankInputAndKeepsSourceAppGates() {
+        let ocrContext = ActionContext(selectedText: "recognized text", bundleID: "com.test.app", source: .ocr)
+        let inputRequired = ActionVisibility.isEnabled(
+            requirements: ActionRequirements(regex: "^recognized", apps: ["com.test.app"], requiresSelection: true),
+            legacyRegex: nil,
+            context: ocrContext
+        )
+        let wrongSourceApp = ActionVisibility.isEnabled(
+            requirements: ActionRequirements(apps: ["com.other.app"], requiresSelection: true),
+            legacyRegex: nil,
+            context: ocrContext
+        )
+        let whitespaceOCR = ActionContext(selectedText: " \n ", source: .ocr)
+        let emptyInputRequired = ActionVisibility.isEnabled(
+            requirements: ActionRequirements(requiresSelection: true),
+            legacyRegex: nil,
+            context: whitespaceOCR
+        )
+        let emptyInputAllowed = ActionVisibility.isEnabled(
+            requirements: ActionRequirements(requiresSelection: false),
+            legacyRegex: nil,
+            context: whitespaceOCR
+        )
 
-        let data = try JSONEncoder().encode(requirements)
-        let roundTripped = try JSONDecoder().decode(ActionRequirements.self, from: data)
-        XCTAssertEqual(roundTripped.expression, "isEmail(text)")
+        XCTAssertTrue(inputRequired.enabled)
+        XCTAssertFalse(wrongSourceApp.enabled)
+        XCTAssertFalse(emptyInputRequired.enabled)
+        XCTAssertTrue(emptyInputAllowed.enabled)
+    }
+
+    func testInputRequirementMatrixAcrossSourceAndEditability() {
+        let cases: [(String, SelectionSource, Bool?, Bool)] = [
+            ("", .selection, true, false),
+            ("text", .selection, true, true),
+            ("text", .selection, false, true),
+            ("text", .selection, nil, true),
+            ("text", .clipboard, false, true),
+            ("text", .ocr, false, true)
+        ]
+        func context(_ item: (String, SelectionSource, Bool?, Bool)) -> ActionContext {
+            ActionContext(selection: SelectionContext(
+                text: item.0,
+                source: item.1,
+                isEditable: item.2,
+                pasteTargetAvailable: true
+            ))
+        }
+
+        for item in cases {
+            XCTAssertTrue(ActionVisibility.isEnabled(
+                requirements: ActionRequirements(input: .optional), legacyRegex: nil, context: context(item)
+            ).enabled, "optional should allow \(item)")
+            XCTAssertEqual(ActionVisibility.isEnabled(
+                requirements: ActionRequirements(input: .text), legacyRegex: nil, context: context(item)
+            ).enabled, item.3, "text requirement for \(item)")
+            XCTAssertEqual(ActionVisibility.isEnabled(
+                requirements: ActionRequirements(input: .liveSelection), legacyRegex: nil, context: context(item)
+            ).enabled, item.1 == .selection && item.3, "liveSelection requirement for \(item)")
+            XCTAssertEqual(ActionVisibility.isEnabled(
+                requirements: ActionRequirements(input: .editableSelection), legacyRegex: nil, context: context(item)
+            ).enabled, item.1 == .selection && item.2 == true && item.3, "editableSelection requirement for \(item)")
+        }
+    }
+
+    func testRequiresPasteTargetFailsClosedOnlyWhenRequested() {
+        for availability in [true, false, nil] as [Bool?] {
+            let context = ActionContext(selection: SelectionContext(
+                text: "input", source: .clipboard, isEditable: false, pasteTargetAvailable: availability
+            ))
+            XCTAssertTrue(ActionVisibility.isEnabled(
+                requirements: ActionRequirements(input: .optional), legacyRegex: nil, context: context
+            ).enabled)
+            XCTAssertEqual(ActionVisibility.isEnabled(
+                requirements: ActionRequirements(input: .optional, requiresPasteTarget: true),
+                legacyRegex: nil,
+                context: context
+            ).enabled, availability == true)
+        }
+    }
+
+    func testSelectionContextClonePreservesSourceCapabilities() {
+        let selection = SelectionContext(
+            text: "editable",
+            source: .selection,
+            isEditable: true,
+            pasteTargetAvailable: true
+        )
+        let moved = selection.with(cursorPosition: CGPoint(x: 10, y: 20))
+        XCTAssertEqual(moved.source, .selection)
+        XCTAssertEqual(moved.isEditable, true)
+        XCTAssertEqual(moved.pasteTargetAvailable, true)
+    }
+
+    func testInputDecodingMapsLegacyAliasesAndRejectsConflictsOrUnknownValues() throws {
+        let oldTrue = try JSONDecoder().decode(ActionRequirements.self, from: #"{"requiresSelection":true}"#.data(using: .utf8)!)
+        let oldFalse = try JSONDecoder().decode(ActionRequirements.self, from: #"{"requires-selection":false}"#.data(using: .utf8)!)
+        XCTAssertEqual(oldTrue.input, .text)
+        XCTAssertEqual(oldFalse.input, .optional)
+        XCTAssertEqual(try JSONDecoder().decode(ActionRequirements.self, from: #"{}"#.data(using: .utf8)!).input, .text)
+        XCTAssertThrowsError(try JSONDecoder().decode(ActionRequirements.self, from: #"{"input":"editableSelection","requiresSelection":true}"#.data(using: .utf8)!))
+        XCTAssertThrowsError(try JSONDecoder().decode(ActionRequirements.self, from: #"{"input":"surprise"}"#.data(using: .utf8)!))
+        XCTAssertThrowsError(try JSONDecoder().decode(ActionRequirements.self, from: #"{"input":true}"#.data(using: .utf8)!))
+        XCTAssertThrowsError(try JSONDecoder().decode(ActionRequirements.self, from: #"{"input":null}"#.data(using: .utf8)!))
+        XCTAssertThrowsError(try JSONDecoder().decode(ActionRequirements.self, from: #"{"input":null,"requiresSelection":true}"#.data(using: .utf8)!))
+        XCTAssertThrowsError(try JSONDecoder().decode(ActionRequirements.self, from: #"{"requiresPasteTarget":null}"#.data(using: .utf8)!))
+        XCTAssertThrowsError(try JSONDecoder().decode(ActionRequirements.self, from: #"{"requiresSelection":true,"requires-selection":false}"#.data(using: .utf8)!))
     }
 
     // MARK: - Regex match / negation
@@ -256,87 +350,52 @@ final class ActionVisibilityTests: XCTestCase {
         }
     }
 
-    // MARK: - expression gate
-
-    func testExpressionGateDisablesWhenEvaluatesFalse() {
-        let requirements = ActionRequirements(expression: "isEmail(text)")
-        let context = ActionContext(selectedText: "not an email")
-        let result = ActionVisibility.isEnabled(requirements: requirements, legacyRegex: nil, expression: attemptParse("isEmail(text)"), context: context)
-        XCTAssertFalse(result.enabled)
-    }
-
-    func testExpressionGateEnablesWhenEvaluatesTrue() {
-        let requirements = ActionRequirements(expression: "isEmail(text)")
-        let context = ActionContext(selectedText: "a@b.com")
-        let result = ActionVisibility.isEnabled(requirements: requirements, legacyRegex: nil, expression: attemptParse("isEmail(text)"), context: context)
+    func testNativeContentMatchesEmbeddedURLsAndSharesExecutionData() {
+        let context = ActionContext(selectedText: "Read https://example.com, then https://github.com.")
+        let rules = ExtensionActionRules(requirements: ActionRequirements(content: [.url]))
+        let result = rules.resolveVisibility(for: context)
         XCTAssertTrue(result.enabled)
+        XCTAssertEqual(result.match.detected.urls, ["https://example.com", "https://github.com"])
+        XCTAssertEqual(result.match.detected, context.selection.detectedContent(for: [.url]))
     }
 
-    func testRegexAndExpressionBothMustPass() {
-        let requirements = ActionRequirements(regex: "^[a-z]+@", expression: "length(text) >= 8")
-        let expression = attemptParse("length(text) >= 8")
-
-        let bothPass = ActionContext(selectedText: "user@example.com")
-        XCTAssertTrue(ActionVisibility.isEnabled(requirements: requirements, legacyRegex: nil, expression: expression, context: bothPass).enabled)
-
-        let regexPassesExpressionFails = ActionContext(selectedText: "a@b.co")
-        // regex ^[a-z]+@ matches, but length < 8
-        XCTAssertFalse(ActionVisibility.isEnabled(requirements: requirements, legacyRegex: nil, expression: expression, context: regexPassesExpressionFails).enabled)
-
-        let regexFails = ActionContext(selectedText: "123@example.com")
-        // regex first pass fails -> disabled without evaluating the expression
-        XCTAssertFalse(ActionVisibility.isEnabled(requirements: requirements, legacyRegex: nil, expression: expression, context: regexFails).enabled)
+    func testContentTypesAreAlternativesAndUnrequestedResultsStayEmpty() {
+        let context = ActionContext(selectedText: "Email user@example.com about https://github.com.")
+        let emailOnly = ActionVisibility.isEnabled(requirements: ActionRequirements(content: [.email]), legacyRegex: nil, context: context)
+        XCTAssertTrue(emailOnly.enabled)
+        XCTAssertEqual(emailOnly.match.detected.emails, ["user@example.com"])
+        XCTAssertTrue(emailOnly.match.detected.urls.isEmpty)
+        let alternatives = ExtensionActionRules(requirements: ActionRequirements(content: [.phone, .email]))
+        XCTAssertTrue(alternatives.resolveVisibility(for: context).enabled)
+        XCTAssertFalse(alternatives.resolveVisibility(for: ActionContext(selectedText: "ordinary text")).enabled)
+        XCTAssertFalse(alternatives.resolveVisibility(for: ActionContext(selectedText: "")).enabled)
     }
 
-    func testLegacyRegexWithExpressionGate() {
-        let context = ActionContext(selectedText: "hello world")
-        let expression = attemptParse("contains(text, \"world\")")
-        let passing = ActionVisibility.isEnabled(requirements: nil, legacyRegex: "^hello", expression: expression, context: context)
-        XCTAssertTrue(passing.enabled)
-        let failingExpr = attemptParse("contains(text, \"moon\")")
-        let failing = ActionVisibility.isEnabled(requirements: nil, legacyRegex: "^hello", expression: failingExpr, context: context)
-        XCTAssertFalse(failing.enabled)
+    func testContentAndExistingRequirementsMustAllPass() {
+        let requirements = ActionRequirements(regex: "^Read", apps: ["com.test.app"], content: [.url])
+        let matches = ActionContext(selectedText: "Read https://example.com")
+        XCTAssertTrue(ActionVisibility.isEnabled(requirements: requirements, legacyRegex: nil, context: matches).enabled)
+        XCTAssertFalse(ActionVisibility.isEnabled(requirements: requirements, legacyRegex: nil, context: ActionContext(selectedText: "Visit https://example.com")).enabled)
+        XCTAssertFalse(ActionVisibility.isEnabled(requirements: requirements, legacyRegex: nil, context: ActionContext(selectedText: "Read https://example.com", bundleID: "com.other.app")).enabled)
+        XCTAssertFalse(ActionVisibility.isEnabled(requirements: requirements, legacyRegex: nil, context: ActionContext(selectedText: "Read ordinary text")).enabled)
+        let live = ActionRequirements(input: .liveSelection, content: [.url])
+        XCTAssertFalse(ActionVisibility.isEnabled(requirements: live, legacyRegex: nil, context: ActionContext(selectedText: "https://example.com", source: .clipboard)).enabled)
+        let paste = ActionRequirements(requiresPasteTarget: true, content: [.url])
+        XCTAssertFalse(ActionVisibility.isEnabled(requirements: paste, legacyRegex: nil, context: matches).enabled)
     }
 
-    func testExpressionRuntimeErrorDisables() {
-        let requirements = ActionRequirements(expression: "length(text) == \"x\"")
-        let context = ActionContext(selectedText: "hello")
-        let result = ActionVisibility.isEnabled(requirements: requirements, legacyRegex: nil, expression: attemptParse("length(text) == \"x\""), context: context)
-        XCTAssertFalse(result.enabled) // fail-closed on eval error
+    func testMalformedRegexCannotBypassContentRequirement() {
+        let rules = ExtensionActionRules(requirements: ActionRequirements(regex: "(", content: [.url]))
+        XCTAssertFalse(rules.resolveVisibility(for: ActionContext(selectedText: "ordinary text")).enabled)
+        XCTAssertTrue(rules.resolveVisibility(for: ActionContext(selectedText: "https://example.com")).enabled)
     }
 
-    func testExpressionWithoutRequirementsGatesAlone() {
-        let context = ActionContext(selectedText: "a@b.com")
-        let passing = ActionVisibility.isEnabled(requirements: nil, legacyRegex: nil, expression: attemptParse("isEmail(text)"), context: context)
-        XCTAssertTrue(passing.enabled)
-    }
-
-    func testResolveVisibilityCarriesCompiledExpression() {
-        let expression = try! ValidateExpression.parse("length(text) > 5").get()
-        let rules = ExtensionActionRules(
-            requirements: ActionRequirements(expression: "length(text) > 5"),
-            compiledExpression: expression
-        )
-        let short = ActionContext(selectedText: "hi")
-        let long = ActionContext(selectedText: "a longer selection")
-        XCTAssertFalse(rules.resolveVisibility(for: short).enabled)
-        XCTAssertTrue(rules.resolveVisibility(for: long).enabled)
-    }
-
-    func testResolveVisibilityWithoutExpressionDelegateToRegex() {
-        let rules = ExtensionActionRules(requirements: ActionRequirements(regex: "^[0-9]+$"))
-        XCTAssertTrue(rules.resolveVisibility(for: ActionContext(selectedText: "12345")).enabled)
-        XCTAssertFalse(rules.resolveVisibility(for: ActionContext(selectedText: "abc")).enabled)
-    }
-
-    func testRulesRoundTripDropsCompiledExpressionButKeepsSource() throws {
-        let rules = ExtensionActionRules(
-            requirements: ActionRequirements(expression: "isEmail(text)"),
-            compiledExpression: try! ValidateExpression.parse("isEmail(text)").get()
-        )
-        let data = try JSONEncoder().encode(rules)
-        let decoded = try JSONDecoder().decode(ExtensionActionRules.self, from: data)
-        XCTAssertEqual(decoded.requirements?.expression, "isEmail(text)")
-        XCTAssertNil(decoded.compiledExpression)
+    func testContentRulesRoundTripAndRejectInvalidOrRetiredRequirements() throws {
+        let rules = ExtensionActionRules(requirements: ActionRequirements(content: [.url, .email]))
+        let decoded = try JSONDecoder().decode(ExtensionActionRules.self, from: JSONEncoder().encode(rules))
+        XCTAssertEqual(decoded, rules)
+        for source in [#"{"content":[]}"#, #"{"content":["unknown"]}"#, #"{"content":"url"}"#, #"{"content":null}"#, #"{"expression":"isURL(text)"}"#] {
+            XCTAssertThrowsError(try JSONDecoder().decode(ActionRequirements.self, from: Data(source.utf8)))
+        }
     }
 }

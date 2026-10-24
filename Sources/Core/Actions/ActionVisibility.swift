@@ -1,31 +1,16 @@
 // ActionVisibility.swift
 // OpenClip
 //
-// The shared visibility evaluator for extension actions. Pure: no UserDefaults, no AppKit, no
-// Keychain. Resolves declarative requirements in a fixed order (selection, app allow/deny,
-// regex/negated, computed expression gate) and, when enabled, builds the ActionMatchInfo that
-// perform-time placeholders and shell env vars consume.
+// Shared visibility evaluator for extension actions. Pure: no UserDefaults, AppKit, or Keychain.
 import Foundation
 
 public enum ActionVisibility {
-    /// Pure function — no UserDefaults, no AppKit, no Keychain reads.
-    ///
-    /// Evaluation order (per plan §3):
-    /// 1. `requiresSelection` (default `true` for extension actions) — empty text disables,
-    ///    except actions that explicitly set `requiresSelection: false`.
-    /// 2. App allow/deny list vs `context.selection.sourceApp.bundleIdentifier`.
-    /// 3. Regex match / negated match; on success build `ActionMatchInfo`.
-    /// 4. Computed visibility via the `expression` DSL (`ValidateExpression`), evaluated with the
-    ///    regex pass's `ActionMatchInfo`; a runtime eval error disables (fail-closed).
-    ///
-    /// A malformed regex enables the action (defensive stance matching legacy URL behavior,
-    /// which returned `true` on a regex compile failure), so a bad manifest never hides an action;
-    /// the expression gate is skipped alongside it. The regex is the fast first pass, so a missing
-    /// or failed regex gate returns before the DSL expression ever evaluates.
+    /// Order: input, paste target, app allow/deny, native content, then regex. The match info built here
+    /// carries captures and detected content to execution. A malformed regex fails open for the regex
+    /// gate only; content requirements still apply.
     public static func isEnabled(
         requirements: ActionRequirements?,
         legacyRegex: String?,
-        expression: ValidateExpression? = nil,
         context: ActionContext
     ) -> (enabled: Bool, match: ActionMatchInfo) {
         let text = context.selection.text
@@ -33,13 +18,28 @@ public enum ActionVisibility {
         let sourceBundleID = context.selection.sourceApp.bundleIdentifier
         let noMatch = ActionMatchInfo(text: text, matchedText: text, captures: [], sourceBundleID: sourceBundleID)
 
-        // 1. requiresSelection (default true for extension actions).
-        let requiresSelection = requirements?.requiresSelection ?? true
-        if requiresSelection && trimmed.isEmpty {
+        // Unknown capability evidence fails closed only when explicitly required.
+        let inputRequirement = requirements?.input ?? .text
+        let hasText = !trimmed.isEmpty
+        let isLiveSelection = context.selection.source == .selection
+        let inputSatisfied: Bool
+        switch inputRequirement {
+        case .optional:
+            inputSatisfied = true
+        case .text:
+            inputSatisfied = hasText
+        case .liveSelection:
+            inputSatisfied = hasText && isLiveSelection
+        case .editableSelection:
+            inputSatisfied = hasText && isLiveSelection && context.selection.isEditable == true
+        }
+        if !inputSatisfied {
+            return (false, noMatch)
+        }
+        if requirements?.requiresPasteTarget == true && context.pasteTargetAvailable != true {
             return (false, noMatch)
         }
 
-        // 2. App allow/deny list vs the source app bundle identifier.
         if let apps = requirements?.apps, !apps.isEmpty {
             switch requirements?.appsMode ?? .allow {
             case .allow:
@@ -53,10 +53,17 @@ public enum ActionVisibility {
             }
         }
 
-        // 3. Regex match / negated match (unchanged). The regex is the fast first pass: a missing
-        //    or failed regex gate returns before the DSL expression ever evaluates.
+        // Detection is cached on the immutable selection snapshot and reused by execution.
+        let requested = requirements?.content ?? []
+        let detected = context.selection.detectedContent(for: requested)
+        let contentMatch = ActionMatchInfo(text: text, matchedText: text, captures: [],
+                                          sourceBundleID: sourceBundleID, detected: detected)
+        if requirements?.content != nil && !requested.contains(where: detected.hasItems) {
+            return (false, contentMatch)
+        }
+
         let pattern = requirements?.regex ?? legacyRegex
-        var matched = noMatch
+        var matched = contentMatch
         var regexEnabled: Bool? = nil
         if let pattern, !pattern.isEmpty {
             do {
@@ -75,42 +82,26 @@ public enum ActionVisibility {
                             }
                         }
                     }
-                    matched = ActionMatchInfo(text: text, matchedText: matchedText, captures: captures, sourceBundleID: sourceBundleID)
+                    matched = ActionMatchInfo(text: text, matchedText: matchedText, captures: captures, sourceBundleID: sourceBundleID, detected: detected)
                     regexEnabled = !(requirements?.regexNegated == true)
                 } else {
                     regexEnabled = requirements?.regexNegated == true
                 }
             } catch {
-                // Defensive: a malformed regex must not hide an action (legacy URL behavior). The
-                // expression gate is skipped alongside it, matching prior behavior.
+                // Malformed regex must not hide an action (legacy URL behavior).
                 Log.coordinator.debug("Malformed enablement regex treated as non-matching: \(error.localizedDescription)")
-                return (true, noMatch)
+                return (true, contentMatch)
             }
         }
         if regexEnabled == false {
             return (false, matched)
         }
 
-        // 4. Computed visibility via the expression DSL (pure Swift, parse-once-eval-many).
-        if let expression {
-            switch expression.evaluate(context, match: matched) {
-            case .success(true):
-                return (true, matched)
-            case .success(false):
-                return (false, matched)
-            case .failure(let error):
-                Log.js.error("Enablement expression evaluation failed: \(error)")
-                return (false, matched)
-            }
-        }
-
         return (true, matched)
     }
 
-    /// Returns the identifiers of required options whose resolved value is empty. Pure helper —
-    /// never called from `isEnabled`/`evaluate` (Gotcha 4: N synchronous Keychain reads per popup
-    /// resolution). Evaluated at perform time: Phase 7's `JavaScriptAction.perform` short-circuits
-    /// to `.openConfiguration` when this returns non-empty.
+    /// IDs of required options whose resolved value is empty. Kept out of `isEnabled` to avoid
+    /// per-popup Keychain reads; checked at perform time.
     public static func missingRequiredOptions(
         requirements: ActionRequirements?,
         resolvedOptions: [String: String]
@@ -122,10 +113,7 @@ public enum ActionVisibility {
         }
     }
 
-    /// Resolves every option value through the given store, then delegates to the pure
-    /// `missingRequiredOptions(requirements:resolvedOptions:)`. Called at perform time (Phase 7)
-    /// before any script runs; a non-empty result means the action cannot run and should open its
-    /// configuration instead.
+    /// Resolves option values through `optionStore`, then delegates to the pure overload.
     public static func missingRequiredOptions(
         requirements: ActionRequirements?,
         options: [ExtensionOption],

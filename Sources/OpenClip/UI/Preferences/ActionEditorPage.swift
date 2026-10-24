@@ -1,18 +1,9 @@
 // ActionEditorPage.swift
 // OpenClip
 //
-// One action's settings as a page of the Settings window: appearance (name, icon, how the popup
-// bar shows it), keyboard (alias, hotkey), and either the options the action declares or, for a
-// GUI-authored custom action, its execution logic. Whether it is on, and duplicating or deleting
-// it, are in the toolbar beside the back and forward arrows — they belong to the action, not to
-// this form, and they take effect without a Save. A built-in action shows it
-// as its own sidebar page; an extension's command, a custom action or a group reach it from their
-// owner's page, the Customize list or the Shortcuts table.
-//
-// This used to be an `.applicationDefined` NSPopover pinned to a list row: a 370pt floating panel
-// that ignored clicks in the list behind it, ignored Escape, and stayed up when you changed panes.
-// As a page it gets the window's width, the toolbar's title says which action it is, and the way
-// back is the same arrow as everywhere else.
+// One action's settings as a Settings window page: appearance, keyboard (alias, hotkey), and the
+// action's options or custom execution logic. Enable, duplicate and delete live in the toolbar and
+// take effect without Save.
 import SwiftUI
 import AppKit
 import Core
@@ -21,35 +12,32 @@ import KeyboardShortcuts
 @MainActor
 public struct ActionEditorPage: View {
     let action: any Action
-    /// True when the page is a sidebar row of its own (a built-in action): there is nothing to go
-    /// back to, so Cancel becomes Revert and Save stays on the page.
+    /// Built-in sidebar page: Cancel becomes Revert and Save stays on the page.
     let isSidebarPage: Bool
     @ObservedObject private var router = SettingsRouter.shared
     @ObservedObject private var coordinator = ActionCoordinator.shared
     @ObservedObject private var customizationManager = ActionCustomizationManager.shared
-    @Setting(SettingKey.disabledActionIDs) private var disabledActionIDs: Set<String>
-    @Setting(SettingKey.disabledPackages) private var disabledPackages: Set<String>
+    @Binding var disabledActionIDs: Set<String>
+    @Binding var disabledPackages: Set<String>
 
+    @State private var isRenamingTitle = false
+    @State private var titleBeforeRename = ""
+    @FocusState private var heroNameFocused: Bool
     @State private var customTitle: String = ""
     @State private var iconSymbol: String = ""
     @State private var initialIconSymbol: String = ""
-    /// Icon-symbol customization stored before the page opened (nil = none). An untouched icon
-    /// field round-trips this on Save instead of writing the picker's baseline, so title-only
-    /// edits can't clobber package-file / remote-image / text-glyph icons.
+    /// Stored icon override before the page opened; an untouched icon field round-trips it on Save,
+    /// so title-only edits can't clobber package-file, remote or text-glyph icons.
     @State private var initialStoredSymbol: String? = nil
-    /// The action's effective real icon while no replacement has been picked from the picker;
-    /// drives the honest preview in the Appearance fields.
+    /// Real icon until a replacement is picked; drives the honest preview.
     @State private var baseIconState: ActionIcon? = nil
-    /// Set by Reset to Default; the persisted override is cleared on Save (not immediately), so
-    /// Cancel still backs out of an accidental reset.
+    /// Reset to Default clears the override only on Save, so Cancel can still undo it.
     @State private var appearanceResetPending = false
     @State private var displayMode: Int = 0 // 0 = Icon, 1 = Text
     @State private var isIconHovered = false
     @State private var isIconPickerPresented = false
 
-    // Custom Action State. The Type picker selects a plain kind — the payload values live in the
-    // field state below — so the segment highlight stays stable while the user edits text (a
-    // CustomActionType selection would embed the live string and unhighlight on every keystroke).
+    // The Type picker holds a plain kind, not the payload, so its highlight stays put while text is edited.
     private enum EditKind: Hashable {
         case openURL
         case textSnippet
@@ -65,15 +53,17 @@ public struct ActionEditorPage: View {
     @State private var customJavaScript: String = "function action(text) {\n    return text.toUpperCase();\n}"
     @State private var customJSIsAsync: Bool = false
     @State private var replaceSelection: Bool = true
+    @State private var aiPrompt: String = ""
+    @State private var isPromptExpanded = false
+    @State private var aiProviderOverride: String?
+    @State private var aiModelOverride: String?
 
     // Manifest-backed state: the target action lives in an extension manifest package.
     @State private var manifestState: LocatedManifest?
     @State private var logicEditable: Bool = false
-    // True when a non-builtin action has no locatable manifest (standalone script file), so the
-    // page must stay read-only instead of dropping edits on Save.
+    // Non-builtin action with no locatable manifest (standalone script): stay read-only rather than drop edits.
     @State private var manifestMissing: Bool = false
-    /// Why the last Save did not go through. Shown inline above the buttons, where an alert used
-    /// to run modal over the window.
+    /// Why the last Save failed; shown inline above the buttons.
     @State private var saveErrorMessage: String?
     @State private var aliasText: String = ""
     @State private var aliasError: String? = nil
@@ -94,10 +84,14 @@ public struct ActionEditorPage: View {
 
     public init(
         action: any Action,
-        isSidebarPage: Bool = false
+        isSidebarPage: Bool = false,
+        disabledActionIDs: Binding<Set<String>>,
+        disabledPackages: Binding<Set<String>>
     ) {
         self.action = action
         self.isSidebarPage = isSidebarPage
+        self._disabledActionIDs = disabledActionIDs
+        self._disabledPackages = disabledPackages
         let initialDelivery: String
         if let pref = ActionCustomizationManager.shared.override(for: action.id)?.deliveryPreference {
             initialDelivery = pref.rawValue
@@ -111,6 +105,20 @@ public struct ActionEditorPage: View {
         SettingsDestination.isCustomAction(action)
     }
 
+    private var isAIPreset: Bool {
+        ActionIdentity.isAIPreset(action)
+    }
+
+    private var aiPreset: AIActionPreset? {
+        guard isAIPreset else { return nil }
+        return AIServiceManager.shared.preset(forActionID: action.id)
+    }
+
+    private var isCustomAIPreset: Bool {
+        guard let aiPreset else { return false }
+        return !AIServiceManager.defaultPresets.contains(where: { $0.id == aiPreset.id })
+    }
+
     private var canDuplicate: Bool {
         ActionIdentity.canDuplicate(action)
     }
@@ -119,6 +127,7 @@ public struct ActionEditorPage: View {
     private var isCurrent: Bool {
         switch router.currentPage {
         case .action(let id), .builtinAction(let id): return id == action.id
+        case .aiPreset(let id): return id == aiPreset?.id
         case .extensionPackage(let id):
             return ActionIdentity.extensionPackageID(of: action) == id
         default: return false
@@ -129,8 +138,7 @@ public struct ActionEditorPage: View {
         ActionIdentity.isBuiltin(action)
     }
 
-    /// The request that opened this page from outside the window, if any: the popup found the
-    /// action with required options unset.
+    /// Request that opened this page from the popup because required options are unset.
     private var configurationRequest: ConfigurationRequest? {
         router.configurationRequest(for: action.id)
     }
@@ -146,8 +154,7 @@ public struct ActionEditorPage: View {
         }
     }
 
-    /// Banner text when the page was opened because the action needs configuration. Falls back to a
-    /// generic message when the request has no reason but does name missing options.
+    /// Banner text for a configuration request; generic when it names missing options but gives no reason.
     private var configurationBannerText: String? {
         guard let configurationRequest else { return nil }
         if let reason = configurationRequest.reason, !reason.isEmpty { return reason }
@@ -176,7 +183,7 @@ public struct ActionEditorPage: View {
         return ""
     }
 
-    /// The hero tile uses the action or extension's meaningful semantic color.
+    /// Semantic tint of the action or its extension.
     private var heroTint: Color {
         if let packageID = ActionIdentity.extensionPackageID(of: action) {
             return SettingsTint.extensionTint(for: packageID)
@@ -200,6 +207,8 @@ public struct ActionEditorPage: View {
     }
 
     private var canProduceTextOutput: Bool {
+        // AI presets stream through the controller's AI flow, not the ordinary delivery preference.
+        if isAIPreset { return false }
         if action.chrome.outputKind == .text || action.chrome.outputKind == .dynamic {
             return true
         }
@@ -207,7 +216,7 @@ public struct ActionEditorPage: View {
             return false
         }
         if isBuiltin { return false }
-        if ActionIdentity.isAIPreset(action) || action.chrome.launchesAI { return true }
+        if action.chrome.launchesAI { return true }
         if action is CustomAction {
             return editKind != .openURL
         }
@@ -282,49 +291,6 @@ public struct ActionEditorPage: View {
         }
     }
 
-    private var actionDescription: String {
-        let state = manifestState ?? Self.locateManifest(for: action)
-        if let desc = state?.manifest.localizedDescription?.resolve() ?? state?.manifest.description,
-           !desc.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return desc
-        }
-        switch action.id {
-        case "builtin.calculate":
-            return String(localized: "Evaluate math expressions.")
-        case "builtin.define":
-            return String(localized: "Look a word up in the macOS Dictionary.")
-        case "builtin.search":
-            return String(localized: "Search the web with your chosen engine.")
-        case "builtin.copy":
-            return String(localized: "Copy the selected text.")
-        case "builtin.paste":
-            return String(localized: "Paste the clipboard content.")
-        case "builtin.cut":
-            return String(localized: "Cut the selected text.")
-        case "builtin.calendar":
-            return String(localized: "Add the selected text as a calendar event.")
-        case "builtin.openurl":
-            return String(localized: "Open the selected text as a link.")
-        case "builtin.reveal_in_finder":
-            return String(localized: "Reveal the selected file path in Finder.")
-        case "builtin.completion":
-            return String(localized: "Complete the word you are typing.")
-        default:
-            break
-        }
-        if ActionIdentity.isAIPreset(action) || action.chrome.launchesAI {
-            return String(localized: "Run the selected text through AI.")
-        }
-        if isCustomAction {
-            return String(localized: "A custom action you wrote.")
-        }
-        if let packageID = ActionIdentity.extensionPackageID(of: action),
-           let info = InstalledExtensionInfo.info(for: packageID, in: coordinator.actions) {
-            return info.name
-        }
-        return ""
-    }
-
     private var actionEnabledBinding: Binding<Bool> {
         ActionEnablement.binding(
             for: action,
@@ -375,8 +341,7 @@ public struct ActionEditorPage: View {
         .frame(width: size, height: size)
     }
 
-    /// The destructive Delete control shared by a custom action and an installed extension's
-    /// header row: a trash glyph in a red-tinted glass capsule, posting its own confirmation.
+    /// Destructive Delete control for custom actions and installed extensions.
     @ViewBuilder
     private func deleteButton(_ action: @escaping () -> Void) -> some View {
         if #available(macOS 26.0, *) {
@@ -510,10 +475,35 @@ public struct ActionEditorPage: View {
                     VStack(alignment: .leading, spacing: 3) {
                         let displayTitle = customTitle.trimmingCharacters(in: .whitespacesAndNewlines)
                         HStack(alignment: .center, spacing: 8) {
-                            Text(displayTitle.isEmpty ? action.title : displayTitle)
-                                .font(.system(size: 16, weight: .semibold))
-                                .foregroundStyle(SettingsDesignTokens.primaryText)
-                                .lineLimit(1)
+                            if isRenamingTitle {
+                                TextField("Action Name", text: $customTitle)
+                                    .textFieldStyle(.plain)
+                                    .font(.system(size: 16, weight: .semibold))
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 4)
+                                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.05)))
+                                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.accentColor.opacity(0.65), lineWidth: 1))
+                                    .frame(maxWidth: 280, alignment: .leading)
+                                    .focused($heroNameFocused)
+                                    .onAppear { heroNameFocused = true }
+                                    .onSubmit { isRenamingTitle = false }
+                                    .onExitCommand {
+                                        customTitle = titleBeforeRename
+                                        isRenamingTitle = false
+                                    }
+                                    .onChange(of: heroNameFocused) { _, focused in
+                                        if !focused { isRenamingTitle = false }
+                                    }
+                            } else {
+                                Text(displayTitle.isEmpty ? action.title : displayTitle)
+                                    .font(.system(size: 16, weight: .semibold))
+                                    .foregroundStyle(SettingsDesignTokens.primaryText)
+                                    .lineLimit(1)
+                                    .onTapGesture(count: 2) {
+                                        titleBeforeRename = customTitle
+                                        isRenamingTitle = true
+                                    }
+                            }
 
                             if let version = manifestVersion, !version.isEmpty {
                                 Text("v\(version)")
@@ -523,14 +513,7 @@ public struct ActionEditorPage: View {
                                     .padding(.vertical, 1.5)
                                     .background(Capsule().fill(Color(white: 1.0, opacity: 0.08)))
                             }
-                        }
 
-                        if !actionDescription.isEmpty {
-                            Text(actionDescription)
-                                .font(.system(size: 12))
-                                .foregroundStyle(SettingsDesignTokens.secondaryText)
-                                .lineLimit(2)
-                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
 
@@ -541,7 +524,6 @@ public struct ActionEditorPage: View {
                         .toggleStyle(.switch)
                         .controlSize(.regular)
                 }
-
                 if let packageID = extensionPackageID {
                     Divider()
                         .opacity(0.3)
@@ -566,7 +548,7 @@ public struct ActionEditorPage: View {
                         }
                         .fixedSize(horizontal: true, vertical: false)
                     }
-                } else if isCustomAction {
+                } else if isCustomAction || isCustomAIPreset {
                     Divider()
                         .opacity(0.3)
                         .padding(.vertical, 10)
@@ -612,7 +594,10 @@ public struct ActionEditorPage: View {
                     SettingsRow(
                         title: "Icon",
                         subtitle: "Choose a custom symbol for the popup bar.",
-                        systemImage: "app.dashed"
+                        systemImage: "app.dashed",
+                        iconTileTint: heroTint,
+                        plainIcon: true,
+                        descriptionOnHover: true
                     ) {
                         Button {
                             isIconPickerPresented = true
@@ -643,19 +628,12 @@ public struct ActionEditorPage: View {
                     SettingsRow(
                         title: "Name",
                         subtitle: "Custom title shown in search and the popup bar.",
-                        systemImage: "textformat"
+                        systemImage: "textformat",
+                        iconTileTint: Color(red: 0.10, green: 0.74, blue: 0.66),
+                        plainIcon: true,
+                        descriptionOnHover: true
                     ) {
-                        TextField(action.title, text: $customTitle, prompt: Text(action.title))
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 13))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 5)
-                            .background(
-                                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                    .fill(Color(white: 1.0, opacity: 0.08))
-                            )
-                            .frame(maxWidth: 220)
-                            .disabled(manifestMissing)
+                        customNameField
                     }
 
                     SettingsDivider()
@@ -663,7 +641,10 @@ public struct ActionEditorPage: View {
                     SettingsRow(
                         title: "Show as",
                         subtitle: "Display as an icon or as text in the popup bar.",
-                        systemImage: "rectangle.split.2x1"
+                        systemImage: "rectangle.split.2x1",
+                        iconTileTint: SettingsTint.customize,
+                        plainIcon: true,
+                        descriptionOnHover: true
                     ) {
                         Picker("", selection: $displayMode) {
                             Text("Icon").tag(0)
@@ -687,7 +668,11 @@ public struct ActionEditorPage: View {
                         if hasTriggers {
                             SettingsRow(
                                 title: "Keyboard Shortcut",
-                                subtitle: "Global hotkey to run this action directly."
+                                subtitle: "Global hotkey to run this action directly.",
+                                systemImage: "keyboard",
+                                iconTileTint: SettingsDesignTokens.iconTileColor(forSystemImage: "keyboard"),
+                                plainIcon: true,
+                                descriptionOnHover: true
                             ) {
                                 Shortcut(for: .actionHotkey(action.id))
                             }
@@ -696,7 +681,11 @@ public struct ActionEditorPage: View {
 
                             SettingsRow(
                                 title: "Search Alias",
-                                subtitle: "Keyword to jump to this action in the search palette."
+                                subtitle: "Keyword to jump to this action in the search palette.",
+                                systemImage: "text.magnifyingglass",
+                                iconTileTint: SettingsDesignTokens.iconTileColor(forSystemImage: "magnifyingglass"),
+                                plainIcon: true,
+                                descriptionOnHover: true
                             ) {
                                 HStack(spacing: 8) {
                                     if let aliasError {
@@ -726,7 +715,11 @@ public struct ActionEditorPage: View {
                         if hasOutput {
                             SettingsRow(
                                 title: "When finished",
-                                subtitle: "Where to send the output of this action."
+                                subtitle: "Where to send the output of this action.",
+                                systemImage: "arrow.turn.down.right",
+                                iconTileTint: SettingsDesignTokens.iconTileColor(forSystemImage: "arrow.turn.down.right"),
+                                plainIcon: true,
+                                descriptionOnHover: true
                             ) {
                                 Picker("", selection: $deliveryPrefString) {
                                     Text("Show in card").tag("preview")
@@ -739,6 +732,53 @@ public struct ActionEditorPage: View {
                             }
                         }
                     }
+                }
+
+                if isAIPreset {
+                    let promptIsEmpty = aiPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    SettingsCard {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.2)) { isPromptExpanded.toggle() }
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Image(systemName: "chevron.right")
+                                        .font(.system(size: 10, weight: .bold))
+                                        .rotationEffect(.degrees(isPromptExpanded || promptIsEmpty ? 90 : 0))
+                                        .frame(width: 10)
+                                    Text("Prompt Instruction")
+                                        .font(.system(size: 13, weight: .medium))
+                                    Spacer()
+                                }
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityValue(isPromptExpanded ? String(localized: "Expanded") : String(localized: "Collapsed"))
+
+                            if isPromptExpanded || promptIsEmpty {
+                                TextField("Prompt instruction...", text: $aiPrompt, axis: .vertical)
+                                    .lineLimit(4...12)
+                                    .textFieldStyle(.roundedBorder)
+                                    .accessibilityLabel(String(localized: "Prompt Instruction"))
+
+                                if promptIsEmpty {
+                                    Text("Prompt cannot be empty.")
+                                        .font(.caption)
+                                        .foregroundStyle(.red)
+                                }
+
+                                Text("The selected text is appended to the instruction when the action runs.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.horizontal, SettingsDesignTokens.sectionCardPaddingH)
+                        .padding(.vertical, SettingsDesignTokens.sectionCardPaddingV)
+                    }
+                }
+
+                if isAIPreset {
+                    AIPresetModelSection(provider: $aiProviderOverride, model: $aiModelOverride)
                 }
 
                 if !action.actionOptions.isEmpty {
@@ -881,8 +921,7 @@ public struct ActionEditorPage: View {
             .padding(.vertical, 16)
         }
         .scrollIndicators(.hidden)
-        // Centre the form at the shared measure while its scroll view runs the full width of the
-        // detail column, so the scroll indicator stays at the window edge.
+        // Form is centred at the shared measure; the scroll view stays full-width so the indicator sits at the edge.
         .settingsPaneWidth()
         .onAppear {
             loadInitialState()
@@ -903,6 +942,22 @@ public struct ActionEditorPage: View {
             autoSave()
         }
         .task(id: aliasText) {
+            guard isLoaded, !isDeleting else { return }
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled, !isDeleting else { return }
+            autoSave()
+        }
+        .onChange(of: aiProviderOverride) { _, _ in
+            guard isLoaded, !isDeleting else { return }
+            autoSave()
+        }
+        .task(id: aiModelOverride) {
+            guard isLoaded, !isDeleting else { return }
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled, !isDeleting else { return }
+            autoSave()
+        }
+        .task(id: aiPrompt) {
             guard isLoaded, !isDeleting else { return }
             try? await Task.sleep(for: .milliseconds(350))
             guard !Task.isCancelled, !isDeleting else { return }
@@ -976,6 +1031,21 @@ public struct ActionEditorPage: View {
         }
     }
 
+    @ViewBuilder
+    private var customNameField: some View {
+        TextField(action.title, text: $customTitle, prompt: Text(action.title))
+            .textFieldStyle(.plain)
+            .font(.system(size: 13))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color(white: 1.0, opacity: 0.08))
+            )
+            .frame(maxWidth: 220)
+            .disabled(manifestMissing)
+    }
+
     // MARK: - Extension Updates & Uninstall
 
     private func runCheckForUpdates(packageID: String) {
@@ -1034,10 +1104,9 @@ public struct ActionEditorPage: View {
 
     // MARK: - Delete and duplicate
 
-    /// Asks first, in the banner that floats over the page, the way every destructive step in this
-    /// window does.
+    /// Asks first, via the banner over the page.
     private func confirmDelete() {
-        guard isCustomAction else { return }
+        guard isCustomAction || isCustomAIPreset else { return }
         router.confirmDestructive(
             title: String(localized: "Delete?"),
             message: "",
@@ -1052,6 +1121,14 @@ public struct ActionEditorPage: View {
         isLoaded = false
         let id = action.id
         KeyboardShortcuts.reset(.actionHotkey(id))
+        if let preset = aiPreset {
+            ActionBindingStore.shared.setAlias(nil, for: id)
+            ActionCustomizationManager.shared.resetOverride(for: id)
+            coordinator.setAIActionPlacement(actionIDs: [id], standalone: false)
+            AIServiceManager.shared.presets.removeAll(where: { $0.id == preset.id })
+            router.pop()
+            return
+        }
         ActionCoordinator.shared.deleteCustomAction(actionID: id)
         ActionCustomizationManager.shared.resetOverride(for: id)
         router.clearConfigurationRequest(for: id)
@@ -1083,26 +1160,19 @@ public struct ActionEditorPage: View {
 
     // MARK: - Manifest lookup
 
-    /// Locates the manifest package whose identifier matches the action's chrome source (or, as a
-    /// fallback for stray `.custom` actions, its id) and returns the target action's edit state.
-    /// Only directory-backed manifest packages are considered; a standalone script file with the
-    /// same identifier returns nil, which the page treats as a read-only, uneditable action.
+    /// Finds the directory-backed manifest entry for the action; standalone scripts return nil (read-only).
     static func locateManifest(for action: any Action, in directory: URL = Constants.extensionsDirectory) -> LocatedManifest? {
         ExtensionManifestStore.locateManifest(for: action, in: directory)
     }
 
-    /// True when the located manifest entry is `actionID` itself. The locator resolves a nested
-    /// sub-action to its parent group's top-level index, so for a group member this is false and
-    /// the page must not write the entry — doing so would stamp the member's title and icon onto
-    /// the whole group. Pure, unit-tested.
+    /// True when the located entry is `actionID` itself; group members resolve to the parent group's index, so writing would rename the whole group.
     static func locatedEntryBacks(actionID: String, in state: LocatedManifest) -> Bool {
         guard state.manifest.actions.indices.contains(state.targetIndex) else { return false }
         let meta = state.manifest.actions[state.targetIndex]
         return ExtensionManager.uniformActionID(metadata: meta, manifest: state.manifest, index: state.targetIndex) == actionID
     }
 
-    /// Resolves the specific `ExtensionActionMetadata` for `actionID`. If `actionID` belongs to a
-    /// sub-action of a group, searches through the group's `subActions` hierarchy.
+    /// Resolves `ExtensionActionMetadata` for `actionID`, searching group `subActions` when needed.
     static func targetMetadata(for actionID: String, in state: LocatedManifest) -> ExtensionActionMetadata? {
         guard state.manifest.actions.indices.contains(state.targetIndex) else { return nil }
         let topMeta = state.manifest.actions[state.targetIndex]
@@ -1139,17 +1209,14 @@ public struct ActionEditorPage: View {
         return nil
     }
 
-    /// Determines if a JavaScript extension produces text output governed by the delivery preference.
     static func jsProducesText(code: String) -> Bool {
         ScriptOutputSniffers.jsProducesText(code: code)
     }
 
-    /// Determines if an AppleScript extension produces text output.
     static func appleScriptProducesText(code: String) -> Bool {
         ScriptOutputSniffers.appleScriptProducesText(code: code)
     }
 
-    /// Determines if a shell extension produces text output to stdout.
     static func shellProducesText(code: String) -> Bool {
         ScriptOutputSniffers.shellProducesText(code: code)
     }
@@ -1160,12 +1227,18 @@ public struct ActionEditorPage: View {
             if let d = cur as? DeliveryDecoratedAction { cur = d.base; continue }
             if let k = cur as? KeywordDecoratedAction { cur = k.base; continue }
             if let m = cur as? MenuDecoratedAction { cur = m.base; continue }
+            if let rich = cur as? RichInputAction { cur = rich.base; continue }
             break
         }
         return cur
     }
 
     // MARK: - State loading
+
+    /// Only GUI-authored custom actions (com.custom.<id>) allow logic editing; other packages stay read-only.
+    static func isLogicEditable(manifestIdentifier: String) -> Bool {
+        manifestIdentifier.hasPrefix(Constants.customIdentifierPrefix)
+    }
 
     private func loadInitialState() {
         let override = ActionCustomizationManager.shared.override(for: action.id)
@@ -1177,8 +1250,12 @@ public struct ActionEditorPage: View {
         } else {
             deliveryPrefString = Self.defaultDeliveryPrefString(for: action)
         }
-        initialStoredSymbol = Self.sanitizedStoredSymbol(override?.customIconSymbol, actionIcon: action.icon)
-        seedBaseline(from: ActionCustomizationManager.shared.popupIcon(for: action))
+        // A saved "star" on an AI preset is a deliberate icon choice, not the legacy placeholder.
+        initialStoredSymbol = isAIPreset
+            ? override?.customIconSymbol
+            : Self.sanitizedStoredSymbol(override?.customIconSymbol, actionIcon: action.icon)
+        // Preview the icon that returns when switching back to Show Icon; a Show Text override must not replace it.
+        seedBaseline(from: ActionCustomizationManager.shared.tableIcon(for: action))
         displayMode = Self.initialDisplayMode(override: override, actionIcon: action.icon)
         if let customAction = action as? CustomAction {
             manifestState = nil
@@ -1188,29 +1265,27 @@ public struct ActionEditorPage: View {
             return
         }
 
-        if isBuiltin {
+        if isBuiltin || isAIPreset {
             manifestState = nil
             logicEditable = false
             manifestMissing = false
+            aiPrompt = aiPreset?.prompt ?? ""
+            aiProviderOverride = aiPreset?.provider
+            aiModelOverride = aiPreset?.model
             return
         }
 
         manifestState = Self.locateManifest(for: action)
         guard let state = manifestState else {
-            // Standalone-script action (or a stray non-builtin with no manifest on disk): the JSON
-            // manifest is the only editable surface, so there is nothing to write. Keep the page
-            // read-only and disable Save rather than silently dropping edits.
+            // Standalone script: the JSON manifest is the only editable surface, so stay read-only.
             logicEditable = false
             manifestMissing = true
             return
         }
         manifestMissing = false
 
-        // Raw execution-logic editing (type/URL/script) is a GUI-authored-action surface only:
-        // com.custom.<id> packages keep the editor, while store and developer extension packages
-        // stay read-only — their behavior belongs to the package, and an accidental rewrite here
-        // would silently mutate an installed third-party extension.
-        guard state.manifest.identifier.hasPrefix(Constants.customIdentifierPrefix) else {
+        // Only com.custom.<id> packages keep logic editing; store and developer packages stay read-only.
+        guard Self.isLogicEditable(manifestIdentifier: state.manifest.identifier) else {
             logicEditable = false
             return
         }
@@ -1238,9 +1313,7 @@ public struct ActionEditorPage: View {
         }
     }
 
-    /// Seeds the icon editor from an effective icon: symbol-representable icons become the editable
-    /// string baseline; package-file / remote-image / text-glyph icons stay out of the string field
-    /// ("" = untouched) and are previewed via `baseIconState` instead of a placeholder symbol.
+    /// Symbol icons become the editable baseline; file, remote and text-glyph icons stay out of the string field and preview via `baseIconState`.
     private func seedBaseline(from icon: ActionIcon) {
         if case .symbol(let sym) = icon {
             iconSymbol = sym
@@ -1292,7 +1365,7 @@ public struct ActionEditorPage: View {
         aliasError = nil
         if let customAction = action as? CustomAction {
             _ = saveCustomActionChanges(customAction)
-        } else if !isBuiltin {
+        } else if !isBuiltin && !isAIPreset && logicEditable {
             Task {
                 _ = await saveManifestChanges()
             }
@@ -1334,7 +1407,22 @@ public struct ActionEditorPage: View {
             _ = saveCustomActionChanges(customAction)
             return
         }
-        if !isBuiltin {
+        if isAIPreset {
+            let prompt = aiPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            let model = aiModelOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if var preset = aiPreset {
+                let promptChanged = !prompt.isEmpty && prompt != preset.prompt
+                let modelChanged = preset.provider != aiProviderOverride || preset.model != (model?.isEmpty == true ? nil : model)
+                if promptChanged || modelChanged {
+                    if promptChanged { preset.prompt = prompt }
+                    preset.provider = aiProviderOverride
+                    preset.model = model?.isEmpty == true ? nil : model
+                    AIServiceManager.shared.updatePreset(preset)
+                }
+            }
+            return
+        }
+        if !isBuiltin && logicEditable {
             Task {
                 _ = await saveManifestChanges()
             }
@@ -1396,10 +1484,7 @@ public struct ActionEditorPage: View {
         ActionCustomizationManager.shared.setDeliveryPreference(pref, for: action.id)
     }
 
-    /// The display mode the editor opens in. Show Text wins when a text override is stored (it
-    /// outranks a symbol in `popupIcon`); a stored symbol override means the user already switched
-    /// to Show Icon, which must stick even for builtins whose own icon is a text glyph (Copy/Cut/
-    /// Paste) — those otherwise reopen as Show Text and make the saved switch look lost.
+    /// A stored symbol keeps Show Icon, even for text-glyph builtins; a text override otherwise opens Show Text.
     static func initialDisplayMode(override: ActionOverride?, actionIcon: ActionIcon) -> Int {
         if override?.customIconText != nil { return 1 }
         if override?.customIconSymbol != nil { return 0 }
@@ -1407,28 +1492,22 @@ public struct ActionEditorPage: View {
         return 0
     }
 
-    /// The symbol Show Icon mode resolves to for builtin actions whose own icon is a text glyph
-    /// (Copy/Cut/Paste), driving the honest icon-mode preview before any replacement is picked.
+    /// Symbol Show Icon resolves to for text-glyph builtins and AI presets, before any replacement is picked.
     static func iconModeFallbackSymbol(for action: any Action) -> String? {
-        guard case .text = action.icon, ActionIdentity.isBuiltin(action) else { return nil }
+        guard case .text = action.icon,
+              ActionIdentity.isBuiltin(action) || ActionIdentity.isAIPreset(action) else { return nil }
         return (action as? any ConfigurableAction)?.preferenceIconName
     }
 
     // MARK: - Appearance save decisions (pure, unit-tested)
 
-    /// Symbol value to persist for the icon field. A genuinely user-picked change wins; an untouched
-    /// field round-trips whatever was stored before (nil when there was none), so editing only the
-    /// title never rewrites the icon.
+    /// Symbol to persist for the icon field: a user-picked change wins; an untouched field keeps the stored value.
     static func resolvedSymbolOverride(current: String, initial: String, stored: String?) -> String? {
         guard current.isEmpty || current == initial else { return current }
         return stored
     }
 
-    /// Symbol override to persist for the chosen display mode. Show Icon mode needs a resolvable
-    /// symbol: for builtin actions whose own icon is a text glyph (Copy/Cut/Paste) the builtin's
-    /// preference symbol is persisted — otherwise `ActionCustomizationManager.popupIcon` keeps
-    /// resolving the text glyph and the switch to icon mode never takes effect. A field-level pick
-    /// or a previously stored symbol wins. Show Text mode only round-trips the icon field.
+    /// Symbol to persist for the display mode. Show Icon needs a resolvable symbol, so text-glyph builtins persist their preference symbol.
     static func resolvedIconModeSymbolOverride(
         displayMode: Int,
         current: String,
@@ -1442,9 +1521,7 @@ public struct ActionEditorPage: View {
         return iconModeFallbackSymbol(for: action)
     }
 
-    /// Overrides written before the icon-clobber fix stored a literal "star" placeholder for every
-    /// non-symbol-representable icon. Treat those as absent so the next Save heals them; a genuine
-    /// "star" pick is kept only when the action's own icon already is that symbol.
+    /// Legacy "star" placeholders are treated as absent so the next Save heals them, unless the action's own icon is "star".
     static func sanitizedStoredSymbol(_ raw: String?, actionIcon: ActionIcon) -> String? {
         guard let raw, !raw.isEmpty else { return nil }
         if raw == legacyFallbackSymbol {
@@ -1457,21 +1534,18 @@ public struct ActionEditorPage: View {
     private static let legacyFallbackSymbol = "star"
 
     private func saveManifestChanges() async -> Bool {
+        guard logicEditable else { return true }
         guard let state = manifestState else {
-            // Defensive: the Save button is disabled in this state, but if reached anyway (e.g. a
-            // keyboard path) surface the reason instead of silently returning with edits dropped.
+            // Save is disabled in this state; if reached anyway, surface the reason rather than drop edits silently.
             return fail(String(localized: "This action is backed by a standalone script file with no editable manifest, so changes cannot be saved here."))
         }
 
-        // A sub-action of an extension group resolves to the group's manifest entry. Its
-        // appearance override was persisted above and its option values save as they are edited,
-        // so there is nothing left to write — and writing here would rename the parent group.
+        // Group sub-actions save as they are edited; writing the group entry here would rename the parent group.
         guard Self.locatedEntryBacks(actionID: action.id, in: state) else { return true }
 
         let meta = state.manifest.actions[state.targetIndex]
         let finalTitle = customTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Only rewrite the icon when the user actually changed it, so local-file icons on
-        // extension actions aren't clobbered by the symbol-only fallback value.
+        // Only rewrite the icon when changed, so local-file icons on extension actions aren't clobbered.
         let finalIcon = (iconSymbol != initialIconSymbol && !iconSymbol.isEmpty) ? iconSymbol : meta.icon
 
         var newURL = meta.url
@@ -1525,7 +1599,9 @@ public struct ActionEditorPage: View {
             localizedTitle: (finalTitle.isEmpty || finalTitle == meta.title || finalTitle == meta.localizedTitle?.resolve()) ? meta.localizedTitle : nil,
             localizedLoadingMessage: meta.localizedLoadingMessage,
             output: meta.output,
-            result: meta.result
+            result: meta.result,
+            captureRtf: meta.captureRtf,
+            captureHtml: meta.captureHtml
         )
 
         var actions = state.manifest.actions
@@ -1554,9 +1630,7 @@ public struct ActionEditorPage: View {
             return fail(String(localized: "Failed to save the action manifest: \(error.localizedDescription)"))
         }
 
-        // Re-trust the package with its newly computed fingerprint so tamper detection does not
-        // falsely flag authorized preferences edits — but only if it was already trusted: a
-        // revoked or never-enabled package keeps its trust state (an edit save is not consent).
+        // Re-trust with the new fingerprint, but only if already trusted: an edit save is not consent.
         await ExtensionManager.shared.retrustAfterAuthorizedEdit(packageID: state.manifest.identifier)
         return true
     }

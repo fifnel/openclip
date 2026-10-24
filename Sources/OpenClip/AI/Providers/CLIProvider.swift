@@ -89,10 +89,7 @@ public enum CLIPreset: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    /// Environment variables that ask the CLI to skip its thinking pass, where the tool exposes a
-    /// documented switch. Claude Code turns thinking off with `MAX_THINKING_TOKENS=0`; Codex uses
-    /// its config override instead (see `thinkingDisabledArguments`). Copilot exposes no "off"
-    /// level and custom commands are opaque, so both are left untouched.
+    /// Env vars that skip the CLI's thinking pass where a documented switch exists. Copilot and custom commands have none.
     public var thinkingDisabledEnvironment: [String: String] {
         switch self {
         case .claude: return ["MAX_THINKING_TOKENS": "0"]
@@ -100,8 +97,7 @@ public enum CLIPreset: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    /// Config-override flags that ask the CLI to skip its thinking pass. Codex accepts
-    /// `-c model_reasoning_effort=none`; the other tools are configured via environment instead.
+    /// Config-override flags that skip the thinking pass (Codex only).
     public var thinkingDisabledArguments: [String] {
         switch self {
         case .codex: return ["-c", "model_reasoning_effort=none"]
@@ -117,8 +113,12 @@ public final class CLIProvider: AIProvider {
     public let preset: CLIPreset
     public let customCommand: String
     public let modelOverride: String
+    /// Replacement for the system prompt's role and behavior rules (Settings → AI → System Prompt);
+    /// nil uses the built-in text.
+    public let customGuidelines: String?
 
-    public init(preset: CLIPreset, customCommand: String = "", modelOverride: String = "") {
+    public init(preset: CLIPreset, customCommand: String = "", modelOverride: String = "", customGuidelines: String? = nil) {
+        self.customGuidelines = customGuidelines
         self.preset = preset
         self.customCommand = customCommand.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedModel = modelOverride.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -129,13 +129,14 @@ public final class CLIProvider: AIProvider {
         let preset = self.preset
         let customCommand = self.customCommand
         let modelOverride = self.modelOverride
+        let customGuidelines = self.customGuidelines
 
         return AsyncThrowingStream { continuation in
             let task = Task.detached {
                 do {
                     let validated = try AIRequestSupport.validateInput(prompt: prompt, text: text)
                     let hasInputText = !validated.text.isEmpty
-                    let systemInstruction = AIRequestSupport.systemPrompt(for: validated.prompt, hasInputText: hasInputText)
+                    let systemInstruction = AIRequestSupport.systemPrompt(for: validated.prompt, hasInputText: hasInputText, customGuidelines: customGuidelines)
                     let userContent = AIRequestSupport.userContent(for: validated.text, fallbackPrompt: validated.prompt)
 
                     let invocation = try Self.buildInvocation(
@@ -159,8 +160,7 @@ public final class CLIProvider: AIProvider {
 
     // MARK: - Binary Resolution
 
-    /// Waits for short-lived CLI probes without allowing a stuck login shell or auth command to
-    /// block the caller indefinitely. A timed-out probe is always treated as a failed check.
+    /// Timeout-bounded: a stuck login shell or auth command counts as a failed check.
     nonisolated private static func waitForExit(_ process: Process, timeout: TimeInterval = 10) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while process.isRunning {
@@ -178,12 +178,10 @@ public final class CLIProvider: AIProvider {
         let trimmed = binary.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 
-        // 1. Direct path check if path is absolute
         if trimmed.hasPrefix("/") {
             return FileManager.default.isExecutableFile(atPath: trimmed) ? trimmed : nil
         }
 
-        // 2. Common macOS installation paths
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let standardCandidates = [
             "\(home)/.local/bin/\(trimmed)",
@@ -200,7 +198,7 @@ public final class CLIProvider: AIProvider {
             }
         }
 
-        // 3. Login shell fallback via 'which'
+        // Login shell picks up the user's PATH, which GUI launches lack.
         let pipe = Pipe()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")

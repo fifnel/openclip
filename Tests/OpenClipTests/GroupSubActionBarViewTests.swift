@@ -42,19 +42,37 @@ final class GroupSubActionBarViewTests: XCTestCase {
     }
 
     @MainActor
+    func testCJKTextWidthIsNotUnderestimated() {
+        let twoCJK = TestAction(id: "cjk2", title: "翻译", icon: .text("翻译"))
+        let fourCJK = TestAction(id: "cjk4", title: "正式语气", icon: .text("正式语气"))
+        let fourLatin = TestAction(id: "lat4", title: "Copy", icon: .text("Copy"))
+        XCTAssertGreaterThan(GroupSubActionBarView.estimatedButtonWidth(for: twoCJK), PopupMetrics.actionButtonWidth)
+        XCTAssertGreaterThan(GroupSubActionBarView.estimatedButtonWidth(for: fourCJK),
+                             GroupSubActionBarView.estimatedButtonWidth(for: fourLatin))
+    }
+
+    @MainActor
+    func testEmojiTextWidthIsNotUnderestimated() {
+        let emoji = TestAction(id: "emoji3", title: "x", icon: .text("👍👍👍"))
+        let latin = TestAction(id: "lat3", title: "x", icon: .text("abc"))
+        XCTAssertGreaterThan(GroupSubActionBarView.estimatedButtonWidth(for: emoji),
+                             GroupSubActionBarView.estimatedButtonWidth(for: latin))
+    }
+
+    @MainActor
     func testEstimatedButtonWidthForSymbolAndText() {
         let symbolAction = TestAction(id: "sym", title: "Star", icon: .symbol("star"))
         let shortTextAction = TestAction(id: "t1", title: "AB", icon: .text("AB"))
         let longTextAction = TestAction(id: "t2", title: "Format JSON", icon: .text("Format JSON"))
 
-        // Standard symbol icon defaults to actionButtonWidth (34)
+        // Standard symbol icon defaults to actionButtonWidth (39)
         XCTAssertEqual(GroupSubActionBarView.estimatedButtonWidth(for: symbolAction), PopupMetrics.actionButtonWidth)
-        // Short text (<=2 chars) defaults to actionButtonWidth (34)
+        // Short text (<=2 chars) defaults to actionButtonWidth (39)
         XCTAssertEqual(GroupSubActionBarView.estimatedButtonWidth(for: shortTextAction), PopupMetrics.actionButtonWidth)
-        // Long text is estimated from character count + padding, capped at 125
+        // Long text is estimated from character count + padding, capped at 144
         let longWidth = GroupSubActionBarView.estimatedButtonWidth(for: longTextAction)
         XCTAssertGreaterThan(longWidth, PopupMetrics.actionButtonWidth)
-        XCTAssertLessThanOrEqual(longWidth, 125)
+        XCTAssertLessThanOrEqual(longWidth, 144)
     }
 
     @MainActor
@@ -81,7 +99,7 @@ final class GroupSubActionBarViewTests: XCTestCase {
         XCTAssertEqual(widthWithoutChevrons, expectedActionWidth)
 
         let widthWithChevrons = GroupSubActionBarView.measuredPageWidth(actions: [a1, a2], hasLeftChevron: true, hasRightChevron: true)
-        XCTAssertEqual(widthWithChevrons, expectedActionWidth + 29 + 29)
+        XCTAssertEqual(widthWithChevrons, expectedActionWidth + PopupPageLayout.chevronWidth + PopupPageLayout.chevronWidth)
     }
 
     @MainActor
@@ -117,7 +135,7 @@ final class GroupSubActionBarViewTests: XCTestCase {
             onResult: { _ in },
             onRunAI: { _ in },
             onRunLoadingAction: { _, _ in },
-            onWillPerformAction: { _, _ in },
+            onWillPerformAction: { _, _ in true },
             onActionPerformed: { _ in },
             onClickIntent: { .primary },
             context: ActionContext(selection: SelectionContext(text: "test", sourceApp: AppIdentity(bundleIdentifier: "com.test", localizedName: "Test"), cursorPosition: .zero, timestamp: Date(), appPolicy: .default)),

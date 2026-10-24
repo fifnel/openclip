@@ -1,29 +1,30 @@
 // ExtensionsStoreView.swift
 // OpenClip
 //
-// Provides the extension store browsing view for the Actions tab in preferences,
-// plus the shared view model used by onboarding. Formatted in a unified native macOS inset table.
+// Extension store browsing view for the Actions preferences tab, plus the view model shared with onboarding.
 import SwiftUI
 import Core
 
-/// How the store list is ordered. It replaced an All/Popular/New *filter*, which hid extensions
-/// rather than reordering them — "Popular" dropped everything with no downloads yet, which is
-/// exactly where a new extension starts.
+/// Store list order. Replaced an All/Popular/New filter, which hid extensions instead of reordering them.
 public enum StoreSort: String, CaseIterable, Identifiable, Sendable {
     /// The catalogue's own order, with the curated showcase on top. The default.
     case featured
+    /// Kept for older callers; not offered in the Store menu.
     case name
     case downloads
     case recentlyAdded
+
+    /// Store pages in the sort menu: All, Popular, New.
+    public static let allCases: [StoreSort] = [.featured, .downloads, .recentlyAdded]
 
     public var id: String { rawValue }
 
     public var title: String {
         switch self {
-        case .featured: return String(localized: "Featured")
+        case .featured: return String(localized: "All")
         case .name: return String(localized: "Name")
-        case .downloads: return String(localized: "Downloads")
-        case .recentlyAdded: return String(localized: "Recently Added")
+        case .downloads: return String(localized: "Popular")
+        case .recentlyAdded: return String(localized: "New")
         }
     }
 
@@ -57,8 +58,7 @@ public final class ExtensionsStoreViewModel: ObservableObject {
         "com.openclip.shortenlink",       // Shorten Link
     ]
 
-    /// High-quality built-in fallbacks for curated items ensuring the Featured showcase
-    /// reliably renders all 4 extensions even offline, on slow network, or across pagination slices.
+    /// Built-in fallbacks so the Featured showcase renders all 4 items offline or mid-pagination.
     public static let fallbackFeaturedItems: [ExtensionItem] = [
         ExtensionItem(
             id: "com.openclip.quick-translate",
@@ -130,16 +130,43 @@ public final class ExtensionsStoreViewModel: ObservableObject {
         curatedFeaturedIDs.contains(where: { $0.caseInsensitiveCompare(item.id) == .orderedSame })
     }
 
-    /// True only for a freshly added package still on its first release (`1.0.0`).
-    /// Anything past 1.0.0 has shipped an update, so it is "updated", not "new".
-    public static func isNew(_ item: ExtensionItem) -> Bool {
+    /// How long an extension stays "New" after first added. Mirrored on the website; keep in sync.
+    public static let newWindowDays = 14
+
+    /// Floor for the New list so it is never empty: the newest `minimumNewCount` items. Mirrored on the website.
+    public static let minimumNewCount = 12
+
+    /// True within `newWindowDays` of first being **added** (`addedAt`, not version or `publishedAt`).
+    /// Snapshots without `addedAt` fall back to a `1.0.0` first-release heuristic.
+    public static func isNew(_ item: ExtensionItem, now: Date = Date()) -> Bool {
+        if let added = item.addedDate {
+            guard let cutoff = Calendar(identifier: .gregorian).date(byAdding: .day, value: -newWindowDays, to: now) else {
+                return true
+            }
+            return added >= cutoff
+        }
         guard let v = item.version, !v.isEmpty else { return true }
-        return v == "1.0.0" || v.hasPrefix("1.0.0")
+        return v == "1.0.0"
     }
 
-    /// Curated featured/popular items (first few for the showcase section).
-    /// Uses server-provided curated extensions from the API when available,
-    /// or filters loaded catalog extensions by curated IDs.
+    /// Newest-first by first-added date (falling back to last-release), name as a stable tiebreak.
+    private static func addedNewestFirst(_ a: ExtensionItem, _ b: ExtensionItem) -> Bool {
+        let da = a.addedDate ?? a.publishedDate ?? .distantPast
+        let db = b.addedDate ?? b.publishedDate ?? .distantPast
+        if da != db { return da > db }
+        return a.name.localizedStandardCompare(b.name) == .orderedAscending
+    }
+
+    /// Items added within `newWindowDays`, topped up to `minimum` with the next most recent. Pure.
+    public static func newSelection(_ items: [ExtensionItem], now: Date = Date(), minimum: Int = minimumNewCount) -> [ExtensionItem] {
+        let sorted = items.sorted(by: addedNewestFirst)
+        let windowed = sorted.filter { isNew($0, now: now) }
+        guard windowed.count < minimum else { return windowed }
+        let remaining = sorted.filter { !isNew($0, now: now) }
+        return windowed + remaining.prefix(minimum - windowed.count)
+    }
+
+    /// Curated picks for the Featured section.
     public var featuredSectionItems: [ExtensionItem] {
         if !featuredItems.isEmpty {
             return Array(featuredItems.prefix(4))
@@ -149,31 +176,29 @@ public final class ExtensionsStoreViewModel: ObservableObject {
         return Array(curated.prefix(4))
     }
 
-    /// Top new items for the showcase section: freshly added packages still on
-    /// their first release. Updated packages (past 1.0.0) are excluded, so an
-    /// update is never presented as new. When nothing is on a first release the
-    /// section falls back to the most recently added/updated packages (newest
-    /// first), so it is never empty.
-    public var newSectionItems: [ExtensionItem] {
-        if !newItems.isEmpty {
-            return Array(newItems.prefix(4))
-        }
-        let featuredIDs = Set(featuredSectionItems.map { $0.id.lowercased() })
-        let pool = extensions.filter { !featuredIDs.contains($0.id.lowercased()) }
-        let fresh = pool.filter { Self.isNew($0) }
-        return Array((fresh.isEmpty ? Self.sorted(pool, by: .recentlyAdded) : fresh).prefix(4))
+    /// Full New list (with the `minimumNewCount` floor). Never empty while the catalogue has items.
+    public var newDisplayItems: [ExtensionItem] {
+        var seen = Set<String>()
+        let pool = (newItems + extensions).filter { seen.insert($0.id.lowercased()).inserted }
+        return Self.newSelection(pool)
     }
 
-    /// The remaining catalog items for the "All Extensions" section,
-    /// deduplicating items showcased in the featured and new sections above.
+    /// Four showcase items: new releases first, then updates.
+    public var newSectionItems: [ExtensionItem] {
+        // A featured extension may also be new; keep it here so the New list stays complete.
+        var seen = Set<String>()
+        let pool = (newItems + extensions).filter { seen.insert($0.id.lowercased()).inserted }
+        let recent = Self.sorted(pool, by: .recentlyAdded, apiNewItems: newItems)
+        return Array(recent.prefix(4))
+    }
+
+    /// Remaining items for "All Extensions", minus those showcased above.
     public var remainingAllSectionItems: [ExtensionItem] {
         let showcased = Set(featuredSectionItems.map { $0.id.lowercased() } + newSectionItems.map { $0.id.lowercased() })
         return extensions.filter { !showcased.contains($0.id.lowercased()) }
     }
 
-    /// ID of the last item rendered across the sectioned storefront, used to trigger pagination.
-    /// The sections render Featured → New → All Extensions, so the last rendered row is the final
-    /// All item, falling back through an empty New or Featured section.
+    /// ID of the last rendered item; triggers pagination. Falls back through empty sections.
     public var lastRenderedSectionedItemID: String? {
         remainingAllSectionItems.last?.id
             ?? newSectionItems.last?.id
@@ -187,15 +212,11 @@ public final class ExtensionsStoreViewModel: ObservableObject {
 
     /// True when the given item is the final rendered item in the flat store list.
     public func shouldTriggerFlatPagination(for itemID: String) -> Bool {
-        itemID == displayedExtensions.last?.id
+        itemID == flatDisplayedExtensions.last?.id
     }
 
-    /// Orders `items` without dropping any of them. Pure, so the ordering is pinned by tests.
-    ///
-    /// `newest` is a rank rather than a date: the catalogue carries no published-at field, so the
-    /// API's own "new" list comes first (in its order), then the curated recent ids, then anything
-    /// whose version says it has moved past its first release. Ties keep catalogue order, which is
-    /// why the rank is paired with the original index instead of relying on a stable sort.
+    /// Orders `items` without dropping any. Pure. `newest` is a rank: the API's "new" list, then
+    /// curated recent ids, then items past their first release. Ties keep catalogue order.
     public static func sorted(
         _ items: [ExtensionItem],
         by sort: StoreSort,
@@ -223,9 +244,7 @@ public final class ExtensionsStoreViewModel: ObservableObject {
             }
             let curated = Set(recentNewIDs.map { $0.lowercased() })
 
-            /// Newest first for anything the catalogue dated. The ranks below are the fallback for
-            /// a snapshot from before `publishedAt` existed: the API's own "new" list in its
-            /// order, then the curated ids, then anything past its first release.
+            /// Newest first by date; ranks are the fallback for snapshots without `publishedAt`.
             func rank(_ item: ExtensionItem) -> (Int, Int) {
                 let id = item.id.lowercased()
                 if let position = apiRank[id] { return (0, position) }
@@ -249,21 +268,19 @@ public final class ExtensionsStoreViewModel: ObservableObject {
                 return left.offset < right.offset
             }
 
-            return (newestFirst + ranked).map(\.element)
+            let recent = (newestFirst + ranked).map(\.element)
+            return recent.filter { isNew($0) } + recent.filter { !isNew($0) }
         }
     }
 
-    /// Monotonic result-set generation. Every reset bumps it; any response that resolves
-    /// against a superseded generation is discarded, so a slow earlier request landing late
-    /// (fast typing, page prefetch racing a new search) can never surface stale rows.
+    /// Result-set generation; responses from a superseded generation are discarded.
     private var generation = 0
     /// In-flight debounced search; cancelled when the query changes again.
     private var searchTask: Task<Void, Never>?
     private let api: any ExtensionStoreFetching
     /// Keystroke quiet period before a search actually fires.
     private let debounceNanos: UInt64
-    /// Page size for the active fetch session; onboarding raises it so one request
-    /// covers the whole catalog and curated picks are always in the result set.
+    /// Page size; onboarding raises it so one request covers the whole catalog.
     private var pageLimit: Int = Constants.storePageLimit
 
     public init(api: any ExtensionStoreFetching = ExtensionsAPIClient.shared,
@@ -278,12 +295,17 @@ public final class ExtensionsStoreViewModel: ObservableObject {
         Self.sorted(extensions, by: selectedSort, apiNewItems: newItems)
     }
 
-    /// Debounced, cancellable search entry point for per-keystroke changes. Coalesces rapid
-    /// typing into one request and cancels any in-flight one; the view calls this from
-    /// `onChange(of: searchQuery)` instead of spawning its own unstructured task.
+    /// Rows for the flat store list. New uses the New selection to match the website; searches use only API results.
+    public var flatDisplayedExtensions: [ExtensionItem] {
+        let ordered = displayedExtensions
+        guard selectedSort == .recentlyAdded,
+              searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return ordered }
+        return newDisplayItems
+    }
+
+    /// Debounced, cancellable search for per-keystroke changes; called from `onChange(of: searchQuery)`.
     public func queryDidChange() {
-        // The chosen order carries over into the results: sorting is not a filter, so a search
-        // does not need to undo it.
+        // Sorting is not a filter, so search results keep the chosen order.
         searchTask?.cancel()
         searchTask = Task { [weak self] in
             guard let self else { return }
@@ -300,8 +322,7 @@ public final class ExtensionsStoreViewModel: ObservableObject {
 
         do {
             let response = try await api.fetchExtensions(query: searchQuery, page: currentPage, limit: pageLimit, ignoreCache: ignoreCache)
-            // Superseded mid-flight (newer search/reset owns the result set): touch nothing,
-            // especially not `isLoading`, which now belongs to the winning generation.
+            // Superseded mid-flight: touch nothing, not even `isLoading`, which belongs to the newer generation.
             guard gen == generation else { return }
             networkError = nil
             if let featured = response.featured, !featured.isEmpty {
@@ -333,8 +354,7 @@ public final class ExtensionsStoreViewModel: ObservableObject {
     }
 
     public func resetAndFetch(limit: Int = Constants.storePageLimit, keepPrevious: Bool = false, ignoreCache: Bool = false) async {
-        // Bump first: any in-flight request from the previous generation is dead on arrival
-        // and can neither append rows nor hold the loading flag against this fetch.
+        // Bump first so in-flight requests from the previous generation can't append rows or hold the loading flag.
         generation += 1
         pageLimit = limit
         currentPage = 1
@@ -347,10 +367,42 @@ public final class ExtensionsStoreViewModel: ObservableObject {
         await fetchNextPage(isReset: true, ignoreCache: ignoreCache)
     }
 
-    /// Explicit manual refresh that clears cached store responses and reloads the fresh catalog from the network.
+    /// Loads the whole catalogue, paging until no pages remain, so sorting and counts cover the full set.
+    public func loadAll(limit: Int = Constants.storeFullCatalogLimit, keepPrevious: Bool = false, ignoreCache: Bool = false) async {
+        generation += 1
+        let gen = generation
+        pageLimit = limit
+        currentPage = 1
+        totalPages = 1
+        if !keepPrevious {
+            extensions = []
+            networkError = nil
+        }
+        isLoading = true
+        await fetchNextPage(isReset: true, ignoreCache: ignoreCache)
+        // Keep requesting until past the last page; bail if a newer search or reset superseded this load.
+        while gen == generation, currentPage <= totalPages, !Task.isCancelled {
+            let before = currentPage
+            await fetchNextPage(ignoreCache: ignoreCache)
+            if currentPage == before { break } // no progress (error / superseded): stop
+        }
+        if gen == generation { isLoading = false }
+    }
+
+    /// Manual refresh: clears cached responses and reloads from the network.
     public func refreshCatalog() async {
         await api.invalidateCache()
-        await resetAndFetch(limit: max(pageLimit, 100), keepPrevious: false, ignoreCache: true)
+        await loadAll(limit: max(pageLimit, Constants.storeFullCatalogLimit), keepPrevious: false, ignoreCache: true)
+    }
+}
+
+private struct StoreSectionRow: Identifiable {
+    let id: String
+    let item: ExtensionItem
+
+    init(section: String, item: ExtensionItem) {
+        self.id = "\(section):\(item.id.lowercased())"
+        self.item = item
     }
 }
 
@@ -366,14 +418,11 @@ public struct ExtensionStoreView: View {
     }
 
     public var body: some View {
-        // The search field and the sort button live in the window toolbar, so the pane is just
-        // the list. No padding around `storeContent`: the list has to reach the pane's top edge
-        // for the system to fade it out under the toolbar the way the Form-based panes are. The
-        // 12pt gutter lives on the scrolling content inside instead.
+        // No padding here: the list must reach the top edge so the system fades it under the toolbar.
         storeContent
         .task {
             if viewModel.extensions.isEmpty {
-                await viewModel.resetAndFetch(limit: 100)
+                await viewModel.loadAll(limit: Constants.storeFullCatalogLimit)
             }
         }
     }
@@ -384,7 +433,7 @@ public struct ExtensionStoreView: View {
                 skeletonList
             } else if viewModel.extensions.isEmpty && viewModel.networkError != nil {
                 offlineStateView
-            } else if viewModel.displayedExtensions.isEmpty {
+            } else if viewModel.flatDisplayedExtensions.isEmpty {
                 VStack(spacing: 12) {
                     Spacer()
                     Image(systemName: "sparkles")
@@ -453,6 +502,13 @@ public struct ExtensionStoreView: View {
                     .font(.subheadline)
                     .foregroundStyle(SettingsDesignTokens.secondaryText)
                     .multilineTextAlignment(.center)
+
+                if viewModel.extensions.count > 0 {
+                    Text("\(viewModel.extensions.count) extensions")
+                        .font(.caption)
+                        .foregroundStyle(SettingsDesignTokens.secondaryText.opacity(0.75))
+                        .multilineTextAlignment(.center)
+                }
             }
         }
         .frame(maxWidth: .infinity)
@@ -494,7 +550,10 @@ public struct ExtensionStoreView: View {
 
                 if !viewModel.newSectionItems.isEmpty {
                     sectionHeader(String(localized: "New"))
-                    ForEach(Array(viewModel.newSectionItems.enumerated()), id: \.element.id) { index, ext in
+                    // New may repeat a Featured item; namespace row IDs so SwiftUI doesn't drop the duplicate.
+                    ForEach(viewModel.newSectionItems.map { StoreSectionRow(section: "new", item: $0) }) { row in
+                        let ext = row.item
+                        let index = viewModel.newSectionItems.firstIndex { $0.id == ext.id } ?? 0
                         if index > 0 {
                             rowDivider
                         }
@@ -544,9 +603,9 @@ public struct ExtensionStoreView: View {
         case .featured, .name:
             return String(localized: "All Extensions")
         case .downloads:
-            return String(localized: "Most Downloaded")
+            return String(localized: "Popular")
         case .recentlyAdded:
-            return String(localized: "Recently Added")
+            return String(localized: "New")
         }
     }
 
@@ -557,9 +616,9 @@ public struct ExtensionStoreView: View {
                     storeHeroHeader
                 }
 
-                sectionHeader(flatSectionTitle, count: viewModel.displayedExtensions.count)
+                sectionHeader(flatSectionTitle, count: viewModel.flatDisplayedExtensions.count)
 
-                ForEach(Array(viewModel.displayedExtensions.enumerated()), id: \.element.id) { index, ext in
+                ForEach(Array(viewModel.flatDisplayedExtensions.enumerated()), id: \.element.id) { index, ext in
                     if index > 0 {
                         rowDivider
                     }

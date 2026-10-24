@@ -11,6 +11,7 @@ public enum LocalLLMPreset: String, CaseIterable, Identifiable, Sendable {
     case ollama = "ollama"
     case jan = "jan"
     case llamacpp = "llamacpp"
+    case omlx = "omlx"
     case custom = "custom"
 
     public var id: String { rawValue }
@@ -21,6 +22,7 @@ public enum LocalLLMPreset: String, CaseIterable, Identifiable, Sendable {
         case .ollama: return "Ollama"
         case .jan: return "Jan"
         case .llamacpp: return "llama.cpp / LocalAI"
+        case .omlx: return "oMLX"
         case .custom: return "Custom Local Server"
         }
     }
@@ -31,6 +33,7 @@ public enum LocalLLMPreset: String, CaseIterable, Identifiable, Sendable {
         case .ollama: return "http://localhost:11434/v1"
         case .jan: return "http://localhost:1337/v1"
         case .llamacpp: return "http://localhost:8080/v1"
+        case .omlx: return "http://127.0.0.1:8000/v1"
         case .custom: return "http://localhost:1234/v1"
         }
     }
@@ -41,6 +44,7 @@ public enum LocalLLMPreset: String, CaseIterable, Identifiable, Sendable {
         case .ollama: return ["llama3.2", "llama3.1", "qwen2.5", "mistral", "deepseek-r1"]
         case .jan: return ["default"]
         case .llamacpp: return ["default"]
+        case .omlx: return ["default"]
         case .custom: return ["default"]
         }
     }
@@ -51,6 +55,7 @@ public enum LocalLLMPreset: String, CaseIterable, Identifiable, Sendable {
         case .ollama: return "llama3.2"
         case .jan: return "mistral"
         case .llamacpp: return "default"
+        case .omlx: return "default"
         case .custom: return "default"
         }
     }
@@ -70,8 +75,12 @@ public final class LocalLLMProvider: AIProvider {
     public let baseURL: String
     public let model: String
     public let disableThinking: Bool
+    /// Replacement for the system prompt's role and behavior rules (Settings → AI → System Prompt);
+    /// nil uses the built-in text.
+    public let customGuidelines: String?
 
-    public init(baseURL: String, model: String, disableThinking: Bool = false) {
+    public init(baseURL: String, model: String, disableThinking: Bool = false, customGuidelines: String? = nil) {
+        self.customGuidelines = customGuidelines
         self.baseURL = AIRequestSupport.normalizedBaseURL(baseURL, fallback: "http://localhost:1234/v1")
         let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
         self.model = trimmedModel.isEmpty ? "default" : trimmedModel
@@ -79,13 +88,28 @@ public final class LocalLLMProvider: AIProvider {
     }
 
     public func processStream(prompt: String, text: String) -> AsyncThrowingStream<String, Error> {
+        let validated: (prompt: String, text: String)
+        do {
+            validated = try AIRequestSupport.validateInput(prompt: prompt, text: text)
+        } catch {
+            return AsyncThrowingStream { $0.finish(throwing: error) }
+        }
+        let systemInstruction = AIRequestSupport.systemPrompt(for: validated.prompt, hasInputText: !validated.text.isEmpty, customGuidelines: customGuidelines)
+        let userContent = AIRequestSupport.userContent(for: validated.text, fallbackPrompt: validated.prompt)
+        return stream(systemInstruction: systemInstruction, messages: [.init(role: .user, content: userContent)])
+    }
+
+    public func processStream(refining conversation: AIConversation, instruction: String, currentText: String) -> AsyncThrowingStream<String, Error> {
+        guard let request = conversation.followUpRequest(instruction: instruction, customGuidelines: customGuidelines) else {
+            return processStream(prompt: conversation.followUpTask(current: instruction), text: currentText)
+        }
+        return stream(systemInstruction: request.system, messages: request.messages)
+    }
+
+    private func stream(systemInstruction: String, messages: [AIChatMessage]) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let validated = try AIRequestSupport.validateInput(prompt: prompt, text: text)
-                    let hasInputText = !validated.text.isEmpty
-                    let systemInstruction = AIRequestSupport.systemPrompt(for: validated.prompt, hasInputText: hasInputText)
-                    let userContent = AIRequestSupport.userContent(for: validated.text, fallbackPrompt: validated.prompt)
 
                     // 1. Try standard OpenAI-compatible /chat/completions endpoint
                     let chatURL = Self.resolveChatCompletionsURL(baseURL: baseURL)
@@ -97,10 +121,8 @@ public final class LocalLLMProvider: AIProvider {
 
                             let body = OpenAIChatRequest(
                                 model: model,
-                                messages: [
-                                    .init(role: "system", content: systemInstruction),
-                                    .init(role: "user", content: userContent)
-                                ],
+                                messages: [.init(role: "system", content: systemInstruction)]
+                                    + messages.map { .init(role: $0.role.rawValue, content: $0.content) },
                                 stream: true,
                                 reasoningEffort: disableThinking ? "none" : nil
                             )
@@ -130,7 +152,7 @@ public final class LocalLLMProvider: AIProvider {
                                         continuation.yield(content)
                                     }
                                 }
-                                continuation.finish()
+                                AIRequestSupport.finishStream(continuation)
                                 return
                             }
                         } catch {
@@ -147,7 +169,7 @@ public final class LocalLLMProvider: AIProvider {
                         return
                     }
 
-                    let fullPrompt = "\(systemInstruction)\n\n\(userContent)"
+                    let fullPrompt = ([systemInstruction] + messages.map(\.content)).joined(separator: "\n\n")
                     var request = URLRequest(url: ollamaURL, timeoutInterval: AIRequestSupport.timeoutInterval)
                     request.httpMethod = "POST"
                     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -201,7 +223,7 @@ public final class LocalLLMProvider: AIProvider {
                             }
                         }
                     }
-                    continuation.finish()
+                    AIRequestSupport.finishStream(continuation)
                 } catch {
                     continuation.finish(throwing: error)
                 }

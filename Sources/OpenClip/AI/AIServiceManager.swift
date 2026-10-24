@@ -9,8 +9,7 @@ import Core
 import os
 
 extension Notification.Name {
-    /// Posted by `AIServiceManager` after the AI preset list has been written, so observers
-    /// (e.g. `AIActionSync`) can re-register AI actions against the freshly committed list.
+    /// Posted after the AI preset list is written; `AIActionSync` re-registers on it.
     public static let aiActionPresetsDidChange = Notification.Name("OpenClip.AIActionPresetsDidChange")
 }
 
@@ -20,9 +19,7 @@ public final class AIServiceManager: ObservableObject {
 
     private let settingsStore = DefaultSettingsStore.shared
 
-    // Settings-backed properties route through SettingsStore (the single settings door) and
-    // manually forward `objectWillChange` so Preferences (and any other observers) refresh when
-    // a value changes. Key names and defaults are unchanged from the former @AppStorage surface.
+    // Settings-backed properties route through SettingsStore and forward `objectWillChange` so Preferences refresh.
     public var isAIEnabled: Bool {
         get { settingsStore.get(.isAIEnabled) }
         set { objectWillChange.send(); settingsStore.set(.isAIEnabled, value: newValue) }
@@ -31,15 +28,21 @@ public final class AIServiceManager: ObservableObject {
         get { settingsStore.get(.aiActiveProvider) }
         set { objectWillChange.send(); settingsStore.set(.aiActiveProvider, value: newValue) }
     }
+    /// Re-entrancy guard: reverting `cloudAPIKey` after a failed SecretStore write re-enters `didSet` and can ping-pong forever (issue #42).
+    private var isRevertingCloudAPIKey = false
+
     // API key is stored in ~/.openclip/secrets.json via SecretStore.
     @Published public var cloudAPIKey: String {
         didSet {
+            guard !isRevertingCloudAPIKey else { return }
             if cloudAPIKey.isEmpty {
                 SecretStore.delete(account: Self.cloudAPIKeyAccount)
             } else {
                 let didStore = SecretStore.set(cloudAPIKey, account: Self.cloudAPIKeyAccount)
                 if !didStore {
                     Log.settings.error("Failed to persist cloud API key to SecretStore; reverting value.")
+                    isRevertingCloudAPIKey = true
+                    defer { isRevertingCloudAPIKey = false }
                     cloudAPIKey = oldValue
                 }
             }
@@ -150,20 +153,43 @@ public final class AIServiceManager: ObservableObject {
         get { localModel }
         set { localModel = newValue }
     }
+    /// The custom system prompt guidelines as stored; empty means the built-in prompt. Read
+    /// through `effectiveCustomSystemPrompt` when building a provider.
+    public var customSystemPrompt: String {
+        get { settingsStore.get(.aiCustomSystemPrompt) }
+        set { objectWillChange.send(); settingsStore.set(.aiCustomSystemPrompt, value: Self.normalizedCustomSystemPrompt(newValue)) }
+    }
+
+    /// The guidelines handed to providers: nil unless the user changed the built-in text.
+    public var effectiveCustomSystemPrompt: String? {
+        let stored = Self.normalizedCustomSystemPrompt(customSystemPrompt)
+        return stored.isEmpty ? nil : stored
+    }
+
+    /// What is persisted for an edited system prompt: blank, or the unchanged built-in text, is
+    /// stored as "" so the built-in prompt (and any later improvement to it) keeps applying.
+    public static func normalizedCustomSystemPrompt(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed == AIRequestSupport.defaultGuidelines.trimmingCharacters(in: .whitespacesAndNewlines) {
+            return ""
+        }
+        return trimmed
+    }
+
     public var actionPresetsJSON: String {
         get { settingsStore.get(.aiActionPresetsJSON) }
         set { objectWillChange.send(); settingsStore.set(.aiActionPresetsJSON, value: newValue) }
     }
 
     public static let defaultPresets: [AIActionPreset] = [
-        AIActionPreset(id: "proofread", title: String(localized: "Proofread"), prompt: String(localized: "Fix all spelling, punctuation, and grammar errors with the smallest possible changes. Preserve the original wording, tone, and formatting — do not rewrite or rephrase sentences"), isEnabled: true),
-        AIActionPreset(id: "rewrite", title: String(localized: "Rewrite"), prompt: String(localized: "Rewrite to improve clarity, flow, and word choice while keeping the original meaning, tone, language, and formatting"), isEnabled: true),
-        AIActionPreset(id: "summarize", title: String(localized: "Summarize"), prompt: String(localized: "Provide a concise bulleted summary of the key points, in the same language as the text. Include only essential information — no introduction or closing remarks"), isEnabled: true),
-        AIActionPreset(id: "explain", title: String(localized: "Explain"), prompt: String(localized: "Explain what the text means in clear, simple language, in the same language as the text. Cover the core idea and any important details a beginner would need"), isEnabled: true),
+        AIActionPreset(id: "proofread", title: String(localized: "Proofread"), prompt: String(localized: "Correct spelling, grammar, and punctuation. Make the smallest necessary changes. Preserve wording, meaning, tone, language, and formatting. Return only the corrected text."), isEnabled: true),
+        AIActionPreset(id: "rewrite", title: String(localized: "Rewrite"), prompt: String(localized: "Rewrite for clarity and natural flow. Preserve the meaning, factual details, intent, and original language. Do not add new claims. Return only the rewritten text."), isEnabled: true),
+        AIActionPreset(id: "summarize", title: String(localized: "Summarize"), prompt: String(localized: "Summarize the main points in concise bullets, using the input’s language. Preserve important conclusions, decisions, and qualifications. Do not add information absent from the input."), isEnabled: true),
+        AIActionPreset(id: "explain", title: String(localized: "Explain"), prompt: String(localized: "Explain the input in clear language for a beginner. Describe its main idea and important details. For code, explain what it does and how it works. Use the input’s language unless another language is requested."), isEnabled: true),
         AIActionPreset(id: "translate", title: String(localized: "Translate"), prompt: String(localized: "Translate the text accurately into natural English, preserving the original meaning, tone, and formatting"), isEnabled: true),
-        AIActionPreset(id: "fix_code", title: String(localized: "Fix Code"), prompt: String(localized: "Fix bugs, syntax errors, and logic issues in this code. Keep the same programming language, style, and structure, and change as little as possible. Return only the raw working code — no markdown code fences, no explanations"), isEnabled: true),
-        AIActionPreset(id: "make_shorter", title: String(localized: "Make Shorter"), prompt: String(localized: "Condense this text to be significantly shorter while keeping all essential information, the original language, and the tone. Preserve the overall formatting such as paragraphs and lists"), isEnabled: true),
-        AIActionPreset(id: "formal_tone", title: String(localized: "Formal Tone"), prompt: String(localized: "Rewrite this text in a polished, professional, and formal tone. Keep the original meaning, language, and formatting; replace slang, contractions, and casual phrasing with formal equivalents"), isEnabled: true)
+        AIActionPreset(id: "fix_code", title: String(localized: "Fix Code"), prompt: String(localized: "Correct identifiable syntax errors, bugs, and logic mistakes. Preserve the programming language, intended behavior, existing interfaces, and style. Make the smallest necessary changes and avoid unrelated refactoring. Return only the corrected code without markdown code fences or explanations. If a reliable fix requires essential missing context, briefly state what is needed instead of inventing code."), isEnabled: true),
+        AIActionPreset(id: "make_shorter", title: String(localized: "Make Shorter"), prompt: String(localized: "Shorten the text by removing repetition and unnecessary wording. Preserve essential facts, requests, qualifications, tone, and language. Return only the shortened text."), isEnabled: true),
+        AIActionPreset(id: "formal_tone", title: String(localized: "Formal Tone"), prompt: String(localized: "Rewrite in a professional, formal tone. Preserve meaning, intent, factual details, and language. Avoid inflated wording and unnecessary length. Return only the rewritten text."), isEnabled: true)
     ]
 
     private static let presetDecodeFailureLogged = OSAllocatedUnfairLock(initialState: false)
@@ -191,9 +217,7 @@ public final class AIServiceManager: ObservableObject {
             } else {
                 Log.ai.error("Failed to encode AI action presets for persistence")
             }
-            // Posted after the value above has committed, so observers always read the fresh list
-            // (objectWillChange fires before @AppStorage lands). AIActionSync keeps the registered
-            // AI actions in step with this list.
+            // Post after the write commits so observers read the new list.
             NotificationCenter.default.post(name: .aiActionPresetsDidChange, object: self)
         }
     }
@@ -203,22 +227,14 @@ public final class AIServiceManager: ObservableObject {
         return list.isEmpty ? [Self.defaultPresets[0]] : list
     }
 
-    /// Reorders the preset list, moving `id` into `gapIndex` — the gap the insertion bar was
-    /// drawn in, counted between rows (0 = above the first, `count` = below the last), matching
-    /// the drop semantics of the Actions outline. The list order *is* the order everywhere — the
-    /// AI sub-bar, the search palette, and the Preferences list all read it — so persisting the
-    /// new array is the whole feature.
+    /// Moves `id` into `gapIndex` (between-rows gap, as in the Actions outline). List order drives every AI surface.
     public func movePreset(id: String, toGap gapIndex: Int) {
         let reordered = Self.reordering(presets, moving: id, toGap: gapIndex)
         guard reordered.map(\.id) != presets.map(\.id) else { return }
         presets = reordered
     }
 
-    /// Pure reorder used by `movePreset`, split out so the ordering rules are testable without the
-    /// `@AppStorage`-backed singleton. Gap indices are pre-removal (SwiftUI's `move(fromOffsets:
-    /// toOffset:)` convention), so dropping into the gap directly below a row is a no-op rather
-    /// than an off-by-one. An unknown id or an out-of-range gap leaves the list intact — the gap
-    /// is clamped, never trapped on.
+    /// Pure reorder for `movePreset`. Gap indices are pre-removal (SwiftUI `move` convention); an unknown id leaves the list intact.
     public static func reordering(_ presets: [AIActionPreset], moving id: String, toGap gapIndex: Int) -> [AIActionPreset] {
         guard let sourceIndex = presets.firstIndex(where: { $0.id == id }) else { return presets }
         var list = presets
@@ -226,9 +242,7 @@ public final class AIServiceManager: ObservableObject {
         return list
     }
 
-    /// Builds a user-authored preset with a fresh `custom_` id — the same shape the "Add Custom AI
-    /// Action" sheet writes, so it is deletable in AI → Actions like any other custom preset.
-    /// Pure, so the id/title/prompt rules are testable without the `@AppStorage` singleton.
+    /// Builds a user preset with a fresh `custom_` id, deletable like any other custom preset.
     public static func makeCustomPreset(title: String, prompt: String) -> AIActionPreset {
         AIActionPreset(
             id: "custom_\(UUID().uuidString.prefix(8))",
@@ -238,9 +252,7 @@ public final class AIServiceManager: ObservableObject {
         )
     }
 
-    /// Appends a new custom preset and returns it. The preset list is the single source of truth
-    /// for every AI surface (palette, AI sub-bar, Preferences), so persisting it is the whole
-    /// registration — `AIActionSync` picks the change up through `aiActionPresetsDidChange`.
+    /// Appends a custom preset; `AIActionSync` picks the change up via `aiActionPresetsDidChange`.
     @discardableResult
     public func addCustomPreset(title: String, prompt: String) -> AIActionPreset {
         let preset = Self.makeCustomPreset(title: title, prompt: prompt)
@@ -248,13 +260,11 @@ public final class AIServiceManager: ObservableObject {
         return preset
     }
 
-    /// The preset whose prompt is `prompt` (case- and whitespace-insensitive), if one exists — so
-    /// saving a prompt the user already saved reuses that tool instead of minting a duplicate.
+    /// Existing preset with the same prompt (case and whitespace insensitive), so saves don't duplicate.
     public func preset(matchingPrompt prompt: String) -> AIActionPreset? {
         Self.preset(in: presets, matchingPrompt: prompt)
     }
 
-    /// Pure lookup behind `preset(matchingPrompt:)`.
     public static func preset(in presets: [AIActionPreset], matchingPrompt prompt: String) -> AIActionPreset? {
         let wanted = normalizedPrompt(prompt)
         guard !wanted.isEmpty else { return nil }
@@ -278,9 +288,7 @@ public final class AIServiceManager: ObservableObject {
         presets = current
     }
 
-    /// Maps a registered AI action id (`ai.preset.<presetID>`, see `AIAction`) back to its live
-    /// preset, so palette/preferences routing can resolve the preset without touching `AIAction`'s
-    /// internals.
+    /// Maps an `ai.preset.<presetID>` action id back to the live preset.
     public func preset(forActionID actionID: String) -> AIActionPreset? {
         let prefix = "ai.preset."
         guard actionID.hasPrefix(prefix) else { return nil }
@@ -292,7 +300,6 @@ public final class AIServiceManager: ObservableObject {
         presets = Self.defaultPresets
     }
 
-    /// Resolves the effective prompt for an AI preset.
     public func promptForPreset(_ preset: AIActionPreset) -> String {
         preset.prompt
     }
@@ -300,7 +307,7 @@ public final class AIServiceManager: ObservableObject {
     private static let cloudAPIKeyAccount = "aiCloudAPIKey"
 
     private init() {
-        // Load the API key from the SecretStore (~/.openclip/secrets.json)
+        Self.importSiblingBuildSettings(into: settingsStore)
         if let stored = SecretStore.get(account: Self.cloudAPIKeyAccount) {
             self.cloudAPIKey = stored
         } else if let legacy = UserDefaults.standard.string(forKey: "aiCloudAPIKey"), !legacy.isEmpty {
@@ -322,10 +329,30 @@ public final class AIServiceManager: ObservableObject {
            let legacyModel = defaults.string(forKey: "aiOllamaModel"), !legacyModel.isEmpty {
             localModel = legacyModel
         }
+    }
 
-        if !AppleIntelligenceAvailability.isSupported && activeProviderRaw == "apple" {
-            activeProviderRaw = AIProviderType.local.rawValue
-        }
+    /// The Dev and release builds keep separate preferences domains but share the API key file, so a build that was
+    /// never configured would show a key with no provider. It adopts the other build's AI settings once.
+    static func importSiblingBuildSettings(into store: SettingsStore, bundleID: String? = Bundle.main.bundleIdentifier) {
+        guard let bundleID, let sibling = siblingBundleID(of: bundleID),
+              let defaults = UserDefaults(suiteName: sibling) else { return }
+        importAISettings(into: store, from: DefaultSettingsStore(userDefaults: defaults))
+    }
+
+    static func siblingBundleID(of bundleID: String) -> String? {
+        guard bundleID.hasPrefix("com.openclip.OpenClip") else { return nil }
+        return bundleID.hasSuffix(".dev") ? String(bundleID.dropLast(4)) : bundleID + ".dev"
+    }
+
+    /// Copies the AI settings from `source` when `store` has never had a provider chosen and `source` has.
+    @discardableResult
+    static func importAISettings(into store: SettingsStore, from source: SettingsStore) -> Bool {
+        let name = SettingKey.aiActiveProvider.name
+        guard store.rawObject(forKey: name) == nil, source.rawObject(forKey: name) != nil else { return false }
+        let snapshot = SettingsSnapshotter.capture(store: source, keys: SettingsCatalog.aiKeys, appVersion: "")
+        let result = SettingsSnapshotter.apply(snapshot, to: store, keys: SettingsCatalog.aiKeys)
+        Log.settings.notice("Adopted \(result.applied) AI settings from the other OpenClip build")
+        return result.applied > 0
     }
 
     public var activeProviderType: AIProviderType {
@@ -360,19 +387,36 @@ public final class AIServiceManager: ObservableObject {
     public var providerOverride: (any AIProvider)? = nil
 
     public var currentProvider: any AIProvider {
+        provider(forPresetID: nil)
+    }
+
+    /// The provider for one action: its own provider and model when the preset sets them, otherwise
+    /// the global choice. Connection details (keys, URLs, CLI tool) always come from AI settings.
+    public func provider(forPresetID presetID: String?) -> any AIProvider {
         if let providerOverride {
             return providerOverride
         }
-        switch activeProviderType {
+        let preset = presetID.flatMap { id in presets.first { $0.id == id } }
+        let type = Self.resolvedProviderType(override: preset?.provider, fallback: activeProviderType)
+        let model = preset?.model?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        let guidelines = effectiveCustomSystemPrompt
+        switch type {
         case .apple:
-            return AppleIntelligenceProvider()
+            return AppleIntelligenceProvider(customGuidelines: guidelines)
         case .local:
-            return LocalLLMProvider(baseURL: localURL, model: effectiveLocalModel, disableThinking: localPreset.disablesThinking)
+            return LocalLLMProvider(baseURL: localURL, model: model ?? effectiveLocalModel, disableThinking: localPreset.disablesThinking, customGuidelines: guidelines)
         case .cli:
-            return CLIProvider(preset: cliPreset, customCommand: cliCustomCommand, modelOverride: effectiveCLIModel)
+            return CLIProvider(preset: cliPreset, customCommand: cliCustomCommand, modelOverride: model ?? effectiveCLIModel, customGuidelines: guidelines)
         case .cloud:
-            return CloudAPIProvider(apiKey: cloudAPIKey, model: effectiveCloudModel, serviceProvider: cloudServiceProvider, customBaseURL: cloudCustomURL)
+            return CloudAPIProvider(apiKey: cloudAPIKey, model: model ?? effectiveCloudModel, serviceProvider: cloudServiceProvider, customBaseURL: cloudCustomURL, customGuidelines: guidelines)
         }
+    }
+
+    /// An unknown override, or Apple Intelligence where it is unsupported, falls back to the global provider.
+    static func resolvedProviderType(override: String?, fallback: AIProviderType) -> AIProviderType {
+        guard let override, let type = AIProviderType(rawValue: override),
+              AIProviderType.supportedCases.contains(type) else { return fallback }
+        return type
     }
 }
 
@@ -401,24 +445,24 @@ public enum CloudServiceProvider: String, CaseIterable, Identifiable, Sendable {
 
     public var primaryModel: String {
         switch self {
-        case .openai: return "gpt-4o-mini"
-        case .anthropic: return "claude-3-7-sonnet-latest"
-        case .google: return "gemini-2.0-flash"
+        case .openai: return "gpt-5-mini"
+        case .anthropic: return "claude-sonnet-5-5"
+        case .google: return "gemini-flash-latest"
         case .deepseek: return "deepseek-chat"
         case .groq: return "llama-3.3-70b-versatile"
-        case .openrouter: return "openai/gpt-4o-mini"
+        case .openrouter: return "openrouter/auto"
         case .custom: return "default"
         }
     }
 
     public var defaultModels: [String] {
         switch self {
-        case .openai: return ["gpt-4o-mini", "gpt-4o", "o3-mini", "o1", "gpt-4-turbo"]
-        case .anthropic: return ["claude-3-7-sonnet-latest", "claude-3-5-sonnet-latest", "claude-3-5-haiku-latest", "claude-3-opus-latest"]
-        case .google: return ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+        case .openai: return ["gpt-5-mini", "gpt-5", "gpt-5-nano", "gpt-4.1"]
+        case .anthropic: return ["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"]
+        case .google: return ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-pro-latest"]
         case .deepseek: return ["deepseek-chat", "deepseek-coder", "deepseek-reasoner"]
-        case .groq: return ["llama-3.3-70b-versatile", "mixtral-8x7b-32768", "deepseek-r1-distill-llama-70b"]
-        case .openrouter: return ["openai/gpt-4o-mini", "anthropic/claude-3.7-sonnet", "deepseek/deepseek-r1", "google/gemini-2.0-flash-001"]
+        case .groq: return ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+        case .openrouter: return ["openrouter/auto"]
         case .custom: return ["default"]
         }
     }
@@ -441,11 +485,21 @@ public struct AIActionPreset: Identifiable, Codable, Equatable, Sendable {
     public var title: String
     public var prompt: String
     public var isEnabled: Bool
+    /// `AIProviderType` raw value to run this action on; nil uses the provider chosen in AI settings.
+    public var provider: String?
+    /// Model for the chosen provider (or the global one when `provider` is nil); blank uses that provider's model from AI settings.
+    public var model: String?
 
-    public init(id: String, title: String, prompt: String, isEnabled: Bool = true) {
+    public init(id: String, title: String, prompt: String, isEnabled: Bool = true, provider: String? = nil, model: String? = nil) {
         self.id = id
         self.title = title
         self.prompt = prompt
         self.isEnabled = isEnabled
+        self.provider = provider
+        self.model = model
     }
+}
+
+private extension String {
+    var nonEmpty: String? { isEmpty ? nil : self }
 }

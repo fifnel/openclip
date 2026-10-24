@@ -1,11 +1,9 @@
 // CustomizePage.swift
 // OpenClip
 //
-// The Customize page: the popup bar's layout and action enablement.
-// One reorderable outline of everything the bar shows — drag to change the order, drag onto a group
-// to add to it, select several rows and make a group of them. Each row carries an enable toggle and a
-// chevron to its own page, where its alias, hotkey, and delete live. The search field lives in the
-// window toolbar, like the Store's, so the list itself is just the list.
+// The Customize page: the popup bar's layout and action enablement, as one reorderable outline.
+// Drag to reorder, drag onto a group to add to it, or select rows and group them. Each row has an
+// enable toggle and a chevron to its own page. The search field lives in the window toolbar.
 
 import SwiftUI
 import UniformTypeIdentifiers
@@ -22,8 +20,6 @@ struct CustomizePage: View {
     @ObservedObject private var coordinator = ActionCoordinator.shared
     @ObservedObject private var customizationManager = ActionCustomizationManager.shared
 
-    @State private var isShowingHelp = false
-
     init(
         selectedRowIDs: Binding<Set<String>>,
         disabledActionIDs: Binding<Set<String>>,
@@ -36,9 +32,7 @@ struct CustomizePage: View {
         _query = query
     }
 
-    /// Eligible candidate action IDs for custom grouping. Only top-level standalone actions
-    /// (not AI presets, not AI launcher, not group parents, not extension sub-actions,
-    /// and not existing custom group members) can be selected for a new group.
+    /// Top-level standalone actions among `selectedRowIDs` that can join a new group.
     static func groupCandidates(selectedRowIDs: Set<String>, coordinator: ActionCoordinator) -> [String] {
         let customGroupMemberIDs = Set(coordinator.actionGroupDefs.flatMap(\.memberActionIDs))
 
@@ -93,59 +87,30 @@ struct CustomizePage: View {
             )
 
             if hasNoMatches {
-                // No background: the outline is empty, so the pane shows through and the empty
-                // state reads as part of the pane instead of a mismatched rectangle.
+                // No background, so the empty state reads as part of the pane.
                 ContentUnavailableView.search(text: query)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .overlay(alignment: .bottomTrailing) {
-            helpButton
-        }
     }
 
-    /// The page's instructions, behind the floating help button the pane keeps in its corner —
-    /// the same affordance System Settings uses, so the list itself stays uncluttered.
-    private var helpButton: some View {
-        Button {
-            isShowingHelp.toggle()
-        } label: {
-            Image(systemName: "questionmark")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: 28, height: 28)
-                .background(Circle().fill(.quaternary))
-                .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-        .help(String(localized: "About the Actions list"))
-        .accessibilityLabel(String(localized: "About the Actions list"))
-        .padding(16)
-        .popover(isPresented: $isShowingHelp, arrowEdge: .bottom) {
-            HStack(alignment: .top, spacing: 10) {
-                Image(systemName: "hand.draw")
-                    .font(.system(size: 15))
-                    .foregroundStyle(.secondary)
-                Text("Drag to reorder the popup bar or group actions. Turn off an action to hide it. An alias or hotkey triggers an action anywhere.")
-                    .font(.callout)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .frame(width: 300, alignment: .leading)
-            .padding(16)
-        }
-    }
+
 }
 
 // MARK: - Rows
 
-/// One action in the Actions list: icon, title, enable toggle, and the chevron that opens its page.
-/// Alias, hotkey, and delete live on the action's own settings page.
+/// One action row: icon, title, enable toggle, and a chevron to its page (alias, hotkey and delete live there).
 @MainActor
 struct ActionRowView: View {
     let action: any Action
     let presentationModel: ActionPresentationModel
     @Binding var disabledActionIDs: Set<String>
     @Binding var disabledPackages: Set<String>
+
+    var isRenaming: Bool = false
+    var onRename: ((String?) -> Void)? = nil
+    @State private var editedTitle = ""
+    @FocusState private var nameFocused: Bool
 
     var body: some View {
         let isEnabled = ActionEnablement.binding(
@@ -159,10 +124,31 @@ struct ActionRowView: View {
                 .frame(width: 20, height: 20, alignment: .center)
                 .foregroundStyle(.secondary)
 
-            Text(presentationModel.title)
-                .font(.system(size: 13, weight: .regular))
-                .foregroundStyle(isEnabled.wrappedValue ? .primary : .secondary)
-                .lineLimit(1)
+            if isRenaming {
+                TextField("Action Name", text: $editedTitle)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 4)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.05)))
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.accentColor.opacity(0.65), lineWidth: 1))
+                    .frame(maxWidth: 280, alignment: .leading)
+                    .focused($nameFocused)
+                    .onAppear {
+                        editedTitle = presentationModel.title
+                        nameFocused = true
+                    }
+                    .onSubmit { onRename?(editedTitle) }
+                    .onExitCommand { onRename?(nil) }
+                    .onChange(of: nameFocused) { _, focused in
+                        if !focused { onRename?(editedTitle) }
+                    }
+            } else {
+                Text(presentationModel.title)
+                    .font(.system(size: 13, weight: .regular))
+                    .foregroundStyle(isEnabled.wrappedValue ? .primary : .secondary)
+                    .lineLimit(1)
+            }
 
             if let gated = action as? GatedExtensionAction, let tooltip = extensionGateDescription(for: gated.reason) {
                 GateInfoIcon(tooltip: tooltip)
@@ -202,12 +188,14 @@ struct PackageHeaderRowView: View {
     let packageID: String
     let gatedReason: ExtensionGateReason?
     @Binding var disabledPackages: Set<String>
+    @Binding var disabledActionIDs: Set<String>
 
     var body: some View {
         let isEnabled = ActionEnablement.packageBinding(
             packageID: packageID,
             gatedReason: gatedReason,
-            disabledPackages: $disabledPackages
+            disabledPackages: $disabledPackages,
+            disabledActionIDs: $disabledActionIDs
         )
 
         HStack(alignment: .center, spacing: 10) {

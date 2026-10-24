@@ -1,4 +1,5 @@
 import XCTest
+@testable import Core
 @testable import OpenClip
 
 final class PopupPositionerTests: XCTestCase {
@@ -11,9 +12,7 @@ final class PopupPositionerTests: XCTestCase {
         let frame = PopupPositioner.placeNearReleasePoint(
             releasePoint: release, popupSize: size, screenBounds: screen, alignment: .center
         )
-        // X: centered on release → 400 - 25 = 375
         XCTAssertEqual(frame.origin.x, 375)
-        // Y: above release → 200 + 6 (gap) = 206
         XCTAssertEqual(frame.origin.y, 206)
     }
 
@@ -22,7 +21,6 @@ final class PopupPositionerTests: XCTestCase {
         let frame = PopupPositioner.placeNearReleasePoint(
             releasePoint: release, popupSize: size, screenBounds: screen, alignment: .left
         )
-        // X: left-aligned with firstActionCenterOffset (shadowInset + half a button)
         XCTAssertEqual(frame.origin.x, 400 - PopupPositioner.firstActionCenterOffset)
         XCTAssertEqual(frame.origin.y, 206)
     }
@@ -32,19 +30,79 @@ final class PopupPositionerTests: XCTestCase {
         let frame = PopupPositioner.placeNearReleasePoint(
             releasePoint: release, popupSize: size, screenBounds: screen, alignment: .right
         )
-        // X: right-aligned so the last button's center sits on the release point
         XCTAssertEqual(frame.origin.x, 400 - (size.width - PopupPositioner.firstActionCenterOffset))
         XCTAssertEqual(frame.origin.y, 206)
     }
 
-    // Top-to-Bottom drag: mouse released below start point -> place popup BELOW cursor to avoid covering text
+    func testOCRPopupStaysBesideTheRegionSelectionReleasePoint() {
+        let releasePoint = CGPoint(x: 620, y: 310)
+        let context = SelectionContext(
+            text: "recognized text",
+            cursorPosition: releasePoint,
+            mouseDownLocation: CGPoint(x: 560, y: 340),
+            selectionBounds: CGRect(x: 560, y: 280, width: 160, height: 90),
+            source: .ocr
+        )
+        let frame = PopupPositioner.calculateFrame(
+            for: context,
+            popupSize: CGSize(width: 180, height: 48),
+            in: CGRect(x: 0, y: 0, width: 800, height: 600),
+            alignment: .center,
+            verticalPosition: .above
+        )
+
+        XCTAssertEqual(frame.midX, releasePoint.x)
+        XCTAssertEqual(frame.minY - releasePoint.y, 6)
+        XCTAssertLessThan(frame.minY - releasePoint.y, PopupMetrics.dismissalDistance(for: screen))
+    }
+
+    func testOCRPopupUsesCurrentPointerAndNormalGapAfterRecognitionDelay() {
+        let releasePoint = CGPoint(x: 220, y: 230)
+        let currentPointer = CGPoint(x: 640, y: 390)
+        let anchor = CaptureTextPopupAnchor.resolve(
+            releasePoint: releasePoint,
+            mouseDownPoint: CGPoint(x: 180, y: 250),
+            currentPointer: currentPointer
+        )
+        let context = SelectionContext(
+            text: "recognized text",
+            cursorPosition: anchor.cursorPosition,
+            mouseDownLocation: anchor.mouseDownLocation,
+            selectionBounds: CGRect(x: 180, y: 210, width: 120, height: 80),
+            source: .ocr
+        )
+        let frame = PopupPositioner.calculateFrame(
+            for: context,
+            popupSize: CGSize(width: 180, height: 48),
+            in: screen,
+            alignment: .center,
+            verticalPosition: .above
+        )
+
+        XCTAssertEqual(anchor.cursorPosition, currentPointer)
+        XCTAssertNil(anchor.mouseDownLocation)
+        XCTAssertEqual(frame.midX, currentPointer.x)
+        XCTAssertEqual(frame.minY - currentPointer.y, 6)
+        let dx = max(0, max(frame.minX - currentPointer.x, currentPointer.x - frame.maxX))
+        let dy = max(0, max(frame.minY - currentPointer.y, currentPointer.y - frame.maxY))
+        XCTAssertEqual(hypot(dx, dy), 6)
+        XCTAssertLessThan(hypot(dx, dy), PopupMetrics.dismissalDistance(for: screen))
+    }
+
+    func testOCRArrivalGraceExpiresAndDoesNotBecomePermanent() {
+        let deadline: TimeInterval = 15
+        XCTAssertTrue(PopupDismissalGrace.isActive(now: 14.99, deadline: deadline))
+        XCTAssertFalse(PopupDismissalGrace.isActive(now: deadline, deadline: deadline))
+        XCTAssertFalse(PopupDismissalGrace.isActive(now: 30, deadline: nil))
+    }
+
+    // Top-to-Bottom drag: released below the start point, so the popup goes BELOW the cursor to avoid covering text.
     func testDragDownPositioning() {
         let start = CGPoint(x: 400, y: 350)
         let release = CGPoint(x: 400, y: 200)
         let frame = PopupPositioner.placeNearReleasePoint(
             releasePoint: release, mouseDownPoint: start, popupSize: size, screenBounds: screen
         )
-        // Y: below release → 200 - 50 (height) - 6 (gap) = 144
         XCTAssertEqual(frame.origin.y, 144)
     }
 
@@ -54,7 +112,6 @@ final class PopupPositionerTests: XCTestCase {
         let frame = PopupPositioner.placeNearReleasePoint(
             releasePoint: release, popupSize: size, screenBounds: screen
         )
-        // X clamped: 800 - 50 - 8 = 742
         XCTAssertEqual(frame.origin.x, 742)
     }
 
@@ -64,7 +121,6 @@ final class PopupPositionerTests: XCTestCase {
         let frame = PopupPositioner.placeNearReleasePoint(
             releasePoint: release, popupSize: size, screenBounds: screen
         )
-        // X clamped: 0 + 8 = 8
         XCTAssertEqual(frame.origin.x, 8)
     }
 
@@ -74,7 +130,6 @@ final class PopupPositionerTests: XCTestCase {
         let frame = PopupPositioner.placeNearReleasePoint(
             releasePoint: release, popupSize: size, screenBounds: screen
         )
-        // No room above (580+6+50=636 > 600-8=592), flip below: 580 - 50 - 6 = 524
         XCTAssertEqual(frame.origin.y, 524)
     }
 
@@ -84,7 +139,6 @@ final class PopupPositionerTests: XCTestCase {
         let frame = PopupPositioner.placeNearReleasePoint(
             releasePoint: release, popupSize: size, screenBounds: screen
         )
-        // y = 5 + 6 = 11 — fits above fine
         XCTAssertEqual(frame.origin.y, 11)
     }
 
@@ -139,7 +193,6 @@ final class PopupPositionerTests: XCTestCase {
             screenBounds: screen,
             verticalPosition: .above
         )
-        // Above release: 200 + 6 = 206
         XCTAssertEqual(frame.origin.y, 206)
         XCTAssertTrue(PopupPositioner.isPlacedAbove(frame: frame, releasePoint: release))
     }
@@ -152,7 +205,6 @@ final class PopupPositionerTests: XCTestCase {
             screenBounds: screen,
             verticalPosition: .above
         )
-        // No room above (580 + 6 + 50 > 592), flips below: 580 - 50 - 6 = 524
         XCTAssertEqual(frame.origin.y, 524)
         XCTAssertFalse(PopupPositioner.isPlacedAbove(frame: frame, releasePoint: release))
     }
@@ -166,7 +218,6 @@ final class PopupPositionerTests: XCTestCase {
             screenBounds: screen,
             verticalPosition: .below
         )
-        // Below release: 200 - 50 - 6 = 144
         XCTAssertEqual(frame.origin.y, 144)
         XCTAssertFalse(PopupPositioner.isPlacedAbove(frame: frame, releasePoint: release))
     }
@@ -179,7 +230,6 @@ final class PopupPositionerTests: XCTestCase {
             screenBounds: screen,
             verticalPosition: .below
         )
-        // No room below (30 - 50 - 6 = -26 < 8), flips above: 30 + 6 = 36
         XCTAssertEqual(frame.origin.y, 36)
         XCTAssertTrue(PopupPositioner.isPlacedAbove(frame: frame, releasePoint: release))
     }
@@ -197,7 +247,6 @@ final class PopupPositionerTests: XCTestCase {
             screenBounds: screenBounds
         )
 
-        // MidX aligns exactly with button center (400) because 400 + 156 = 556 <= 700
         XCTAssertEqual(midX, buttonScreenMidX)
         XCTAssertLessThanOrEqual(midX + searchWidth / 2, barMaxX)
     }
@@ -216,7 +265,7 @@ final class PopupPositionerTests: XCTestCase {
             screenBounds: screenBounds
         )
 
-        // Must be capped so palette right edge (midX + searchWidth / 2) does not exceed barMaxX
+        // Capped so the palette's right edge stays within the bar.
         XCTAssertEqual(midX, barMaxX - searchWidth / 2)
         XCTAssertEqual(midX + searchWidth / 2, barMaxX)
     }
@@ -237,4 +286,3 @@ final class PopupPositionerTests: XCTestCase {
         XCTAssertEqual(leftMidX, screenBounds.minX + padding + searchWidth / 2)
     }
 }
-

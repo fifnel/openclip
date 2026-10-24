@@ -1,4 +1,4 @@
-# OpenClip Directory Structure
+# OpenClip directory structure
 
 Annotated source tree. See `docs/architecture/overview.md` for the architectural (target-split)
 view; this is the detailed per-file map.
@@ -63,12 +63,11 @@ Sources/
 │   │   ├── ExtensionsAPIClient.swift         # Remote store API client
 │   │   ├── ExtensionsModels.swift            # Store models & DTOs
 │   │   ├── Manifest/                         # Extension manifest structures
-│   │   │   ├── ActionRequirements.swift      # Requirements model (regex, apps, requiredOptions, expression)
+│   │   │   ├── ActionRequirements.swift      # Requirements model (regex, apps, requiredOptions, content)
 │   │   │   ├── ExtensionActionKind.swift     # Normalized extension kind enum
 │   │   │   ├── ExtensionManifest.swift       # Extension manifest decoder
 │   │   │   ├── ExtensionManifestStore.swift  # Manifest file locate/read/write (shared home)
-│   │   │   ├── ManifestValidation.swift      # Manifest validation pass + empty capability gate + fingerprint record
-│   │   │   └── ValidateExpression.swift      # Computed visibility expression DSL AST & evaluator
+│   │   │   └── ManifestValidation.swift      # Manifest validation pass + empty capability gate + fingerprint record
 │   │   ├── OpenClipSnippetParser.swift       # Standalone snippet header parser (nonisolated, pure text); body mode ends only at `#` header keys, `//` lines stay body
 │   │   ├── ScriptAction.swift                # Executable script action
 │   │   ├── ShellProcessRunner.swift          # Shared subprocess executor; an explicit timeout arms a GCD-timer watchdog that terminates the child (process group when the child is group leader, else snapshotted descendants), with no watchdog when no timeout is set + readabilityHandler reads (never blocks a thread); hosts TimeoutFlag/OnceGate; maps stdout JSON via ShellResultMapper
@@ -92,7 +91,7 @@ Sources/
 │   │   ├── AppFilter.swift                   # App bundle filtering helpers
 │   │   ├── AppIdentifying.swift              # Application identity protocol
 │   │   ├── BrowserDetector.swift             # Browser bundle ID classifier
-│   │   ├── Constants.swift                   # Domain/runtime constants (timeouts, key codes, env vars, manifest keys) — no UI sizing
+│   │   ├── Constants.swift                   # Domain/runtime constants (timeouts, key codes, env vars, manifest keys), no UI sizing
 │   │   ├── SelectionContext.swift            # Selection snapshot context
 │   │   ├── SelectionMonitoring.swift         # Selection monitor protocol
 │   │   ├── TextRetrieving.swift              # Text retrieval protocol
@@ -121,7 +120,7 @@ Sources/
     │       ├── CLIProvider.swift             # Subprocess CLI runner (Claude Code, Codex CLI, GitHub Copilot)
     │       ├── CloudAPIProvider.swift        # OpenAI-compatible / Anthropic / Gemini / DeepSeek / Groq cloud chat
     │       ├── CloudAPIProviderDTOs.swift    # Codable chat request/response payloads for cloud APIs
-    │       └── LocalLLMProvider.swift        # Universal local LLM runner (LM Studio, Ollama, Jan, llama.cpp)
+    │       └── LocalLLMProvider.swift        # Universal local LLM runner (LM Studio, Ollama, Jan, llama.cpp, oMLX)
     ├── Notifications/
     │   └── Notification.Name+OpenClip.swift  # Internal notification names
     ├── Platform/                             # macOS Platform Services
@@ -198,7 +197,7 @@ Sources/
         │   └── PermissionRecoveryWindowController.swift # Permission recovery window controller
         ├── Popup/                            # Floating popup panel
         │   ├── GroupSubActionBarView.swift   # Sub-bar action items view
-        │   ├── PopupGesturePolicy.swift      # Derived popup interaction policy from chrome + conformance (App target — UI-only)
+        │   ├── PopupGesturePolicy.swift      # Derived popup interaction policy from chrome + conformance (App target, UI-only)
         │   ├── PopupHoverSupport.swift       # Shared popup hover-state singleton + hover-target/frame preference keys (bar)
         │   ├── PopupMetrics.swift            # UI-only popup/search/AI-card sizing + placement/dismissal constants (App target, not Core)
         │   ├── PopupModeStore.swift          # Shared observable actions↔search↔content mode + resultCard payload
@@ -250,7 +249,7 @@ Sources/
             ├── PreferencesView.swift         # Settings window root: sidebar + SettingsNavigationStack detail
             ├── SettingsNavigationStack.swift # Mounted-levels page host, SettingsEditorPage footer layout, shared rows
             ├── SettingsDestination.swift     # Router path for any action's settings (builtin row / extension / custom / group)
-            ├── SettingsHeroHeader.swift      # Centred icon/title/subtitle identity block for pages about one thing
+            ├── SettingsHeroHeader.swift      # Centered icon/title/subtitle identity block for pages about one thing
             ├── SettingsNoticeBanner.swift    # Inline (glass) notice that replaces NSAlert in the window
             ├── SettingsRouter.swift          # SettingsPage enum + SettingsRouter (path, history, notices)
             ├── SettingsRowLabel.swift        # Shared settings row shapes

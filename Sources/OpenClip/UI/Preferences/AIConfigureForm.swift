@@ -8,9 +8,7 @@ import AppKit
 
 @MainActor
 public struct AIConfigureForm: View {
-    /// `true` when the caller supplies the surrounding `Form` (the AI preferences pane, which
-    /// appends the AI action library as a further section). `false` renders a self-contained form,
-    /// which is what the first-launch onboarding flow wants.
+    /// `true` when the caller supplies the surrounding `Form` (AI preferences); `false` renders a self-contained form for onboarding.
     private let embedded: Bool
 
     @ObservedObject private var aiManager = AIServiceManager.shared
@@ -19,6 +17,7 @@ public struct AIConfigureForm: View {
     @State private var isFetchingCloudModels: Bool = false
     @State private var cloudFetchError: String? = nil
     @State private var cloudFetchGeneration: Int = 0
+    @State private var cloudKeyDebounceTask: Task<Void, Never>?
 
     @State private var fetchedLocalModels: [String] = []
     @State private var isFetchingLocalModels: Bool = false
@@ -30,8 +29,7 @@ public struct AIConfigureForm: View {
 
     @State private var cliAuthStatus: (isAuthenticated: Bool, message: String)? = nil
     @State private var isCheckingCLIAuth: Bool = false
-    /// Expanded state of the inline "how to authenticate" note. It was a popover hanging off an
-    /// info button — a popover opened from inside a popover, for two sentences and a button.
+    /// Expanded state of the inline "how to authenticate" note.
     @State private var showingAuthHelp: Bool = false
 
     public init(embedded: Bool = false) {
@@ -55,7 +53,7 @@ public struct AIConfigureForm: View {
         Group {
             Section(header: Text("Provider Settings")) {
                 Picker("Select a Provider", selection: Binding(
-                    get: { aiManager.activeProviderRaw },
+                    get: { aiManager.activeProviderType.rawValue },
                     set: { newValue in
                         withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
                             aiManager.activeProviderRaw = newValue
@@ -153,7 +151,6 @@ public struct AIConfigureForm: View {
                         fetchCLIModels()
                     }
 
-                    // Authentication Status Row
                     HStack(spacing: 6) {
                         Text("Status:")
                             .foregroundColor(.secondary)
@@ -243,7 +240,9 @@ public struct AIConfigureForm: View {
                         }
                     }
                     .onChange(of: aiManager.cloudServiceProvider) { _ in
-                        fetchCloudModels()
+                        fetchedCloudModels = []
+                        cloudFetchError = nil
+                        refreshCloudModelsIfStale()
                     }
 
                     if aiManager.cloudServiceProvider == .custom {
@@ -253,6 +252,23 @@ public struct AIConfigureForm: View {
 
                     SecureField("API Key", text: $aiManager.cloudAPIKey)
                         .textFieldStyle(.roundedBorder)
+                        .onChange(of: aiManager.cloudAPIKey) { newKey in
+                            cloudKeyDebounceTask?.cancel()
+                            let trimmed = newKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !trimmed.isEmpty else {
+                                cloudFetchGeneration += 1
+                                isFetchingCloudModels = false
+                                fetchedCloudModels = []
+                                cloudFetchError = nil
+                                return
+                            }
+                            cloudKeyDebounceTask = Task {
+                                try? await Task.sleep(nanoseconds: 500_000_000)
+                                guard !Task.isCancelled else { return }
+                                guard aiManager.activeProviderType == .cloud else { return }
+                                fetchCloudModels()
+                            }
+                        }
 
                     HStack(spacing: 8) {
                         Picker("Model", selection: $aiManager.cloudModel) {
@@ -271,11 +287,17 @@ public struct AIConfigureForm: View {
                         }
                         .buttonStyle(.borderless)
                         .help("Fetch available models live from API")
-                        .disabled(aiManager.cloudAPIKey.isEmpty || isFetchingCloudModels)
+                        .disabled(!canFetchCloudModels || isFetchingCloudModels)
+                    }
+
+                    if isCloudModelUnlisted {
+                        Text("This model is not in the provider's current list. It may have been retired.")
+                            .font(.caption)
+                            .foregroundColor(.orange)
                     }
 
                     if aiManager.cloudModel == "custom" {
-                        TextField("Custom Model Identifier", text: $aiManager.cloudCustomModel, prompt: Text("e.g. gpt-4o-2024-08-06 or claude-3-5-sonnet-latest"))
+                        TextField("Custom Model Identifier", text: $aiManager.cloudCustomModel, prompt: Text("e.g. gpt-5-mini or claude-sonnet-5-5"))
                             .textFieldStyle(.roundedBorder)
                     }
 
@@ -294,24 +316,37 @@ public struct AIConfigureForm: View {
                 fetchCLIModels()
             } else if aiManager.activeProviderType == .local {
                 fetchLocalModels()
-            } else if aiManager.activeProviderType == .cloud && !aiManager.cloudAPIKey.isEmpty {
-                fetchCloudModels()
+            } else if aiManager.activeProviderType == .cloud {
+                refreshCloudModelsIfStale()
             }
         }
+        .onDisappear {
+            cloudKeyDebounceTask?.cancel()
+        }
         .onChange(of: aiManager.activeProviderRaw) { newRaw in
+            cloudKeyDebounceTask?.cancel()
             if newRaw == AIProviderType.cli.rawValue {
                 checkCLIAuth()
                 fetchCLIModels()
             } else if newRaw == AIProviderType.local.rawValue {
                 fetchLocalModels()
-            } else if newRaw == AIProviderType.cloud.rawValue && !aiManager.cloudAPIKey.isEmpty {
-                fetchCloudModels()
+            } else if newRaw == AIProviderType.cloud.rawValue {
+                refreshCloudModelsIfStale()
             }
         }
     }
 
-    /// Inline replacement for the old authentication popover. Same copy, same button, but it
-    /// expands the row it belongs to instead of opening a layer on top of the settings it explains.
+    private var canFetchCloudModels: Bool {
+        !aiManager.cloudAPIKey.isEmpty || aiManager.cloudServiceProvider == .openrouter
+    }
+
+    private func refreshCloudModelsIfStale() {
+        guard canFetchCloudModels else { return }
+        if let cached = CloudModelCatalog.cached(for: aiManager.cloudServiceProvider), CloudModelCatalog.isFresh(cached) { return }
+        fetchCloudModels()
+    }
+
+    /// Inline auth help that expands its own row rather than opening a popover.
     private var authHelpNote: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(authHelpText)
@@ -384,23 +419,19 @@ public struct AIConfigureForm: View {
     }
 
     private var resolvedCloudModels: [String] {
-        if fetchedCloudModels.isEmpty {
-            let primary = aiManager.cloudServiceProvider.primaryModel
-            var list = ["default"]
-            if primary != "default" {
-                list.append(primary)
-            }
-            if !aiManager.cloudModel.isEmpty && aiManager.cloudModel != "custom" && !list.contains(aiManager.cloudModel) {
-                list.append(aiManager.cloudModel)
-            }
-            return list
-        } else {
-            var list = ["default"]
-            for m in fetchedCloudModels where m != "default" {
-                list.append(m)
-            }
-            return list
-        }
+        let provider = aiManager.cloudServiceProvider
+        return ["default"] + CloudModelCatalog.choices(
+            live: fetchedCloudModels,
+            cached: CloudModelCatalog.cached(for: provider),
+            provider: provider,
+            current: aiManager.cloudModel
+        )
+    }
+
+    private var isCloudModelUnlisted: Bool {
+        let model = aiManager.cloudModel
+        guard !fetchedCloudModels.isEmpty, model != "default", model != "custom" else { return false }
+        return !fetchedCloudModels.contains(model)
     }
 
     private func modelDisplayName(_ model: String) -> String {
@@ -472,9 +503,7 @@ public struct AIConfigureForm: View {
                     }
                     self.fetchedCloudModels = models
                     self.isFetchingCloudModels = false
-                    if let first = models.first, !models.contains(aiManager.cloudModel), aiManager.cloudModel != "default", aiManager.cloudModel != "custom" {
-                        aiManager.cloudModel = first
-                    }
+                    CloudModelCatalog.save(models, for: targetProvider)
                 }
             } catch {
                 await MainActor.run {

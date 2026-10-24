@@ -18,7 +18,7 @@ final class ActionResultDeliveryTests: XCTestCase {
         case (.text(let a), .text(let b)): XCTAssertEqual(a, b, message, file: file, line: line)
         case (.cut(let a), .cut(let b)): XCTAssertEqual(a, b, message, file: file, line: line)
         case (.openURL(let a), .openURL(let b)): XCTAssertEqual(a, b, message, file: file, line: line)
-        case (.success, .success), (.none, .none): XCTAssertTrue(true, message, file: file, line: line)
+        case (.success, .success), (.none, .none), (.simulatePaste, .simulatePaste): XCTAssertTrue(true, message, file: file, line: line)
         case (.sequence(let a), .sequence(let b)):
             XCTAssertEqual(a.count, b.count, message.isEmpty ? "sequence length" : message, file: file, line: line)
             for (item, expectedItem) in zip(a, b) {
@@ -74,6 +74,18 @@ final class ActionResultDeliveryTests: XCTestCase {
             delivery: .none
         )
         assertCase(result, .copy("hello"))
+    }
+
+    func testNativeCopyPreservesClickBehaviorAndReportsCopied() {
+        let selection = SelectionContext(text: "Selected", selectionGeneration: 7)
+        for intent in [ActionResultDelivery.ClickIntent.primary, .secondary] {
+            let (result, toast) = ActionResultDelivery.resolve(
+                raw: .copySelection(selection), clickIntent: intent, canPaste: false, delivery: .none
+            )
+            guard case .copySelection(let copied) = result else { return XCTFail("Native Copy must stay native") }
+            XCTAssertEqual(copied.selectionGeneration, 7)
+            XCTAssertEqual(toast?.message, "Copied")
+        }
     }
 
     func testCutStaysCut() {
@@ -252,6 +264,27 @@ final class ActionResultDeliveryTests: XCTestCase {
         assertCase(r, .copy("hello"))
     }
 
+    func testTextWithPreviewPreferenceSecondaryStaysInCard() {
+        let (r, toast) = ActionResultDelivery.resolve(raw: .text("hello"), clickIntent: .secondary, canPaste: true, delivery: .none, preference: .preview)
+        assertCase(r, .text("hello"), "Show in card applies to secondary clicks too")
+        XCTAssertNil(toast)
+    }
+
+    func testRecommendedPreviewSecondaryStillCopies() {
+        let (r, _) = ActionResultDelivery.resolve(raw: .text("hello"), clickIntent: .secondary, canPaste: true, delivery: .none, recommendedResult: .preview)
+        assertCase(r, .copy("hello"), "only the user's own Show in card choice overrides the clipboard invariant")
+    }
+
+    func testPastePreferenceSecondaryStillCopies() {
+        let (r, _) = ActionResultDelivery.resolve(raw: .text("hello"), clickIntent: .secondary, canPaste: true, delivery: .none, preference: .paste)
+        assertCase(r, .copy("hello"))
+    }
+
+    func testPreviewPreferenceSecondaryExplicitPasteStillCopies() {
+        let (r, _) = ActionResultDelivery.resolve(raw: .paste("a"), clickIntent: .secondary, canPaste: true, delivery: .none, preference: .preview)
+        assertCase(r, .copy("a"))
+    }
+
     func testDeclaredSecondaryWinsOverTextPreference() {
         let d = ActionDelivery(secondary: .openURL(URL(string: "https://alt")!))
         let (r, _) = ActionResultDelivery.resolve(raw: .text("a"), clickIntent: .secondary, canPaste: true, delivery: d, preference: .preview)
@@ -340,9 +373,17 @@ final class ActionResultDeliveryTests: XCTestCase {
         return handler.results.first!
     }
 
-    /// Polls `toast.isLoading` until it flips false (the loading toast fades once the action's
-    /// result lands) or the deadline passes — a state-based wait instead of a fixed sleep, so the
-    /// assertion isn't flaky on slow machines.
+    @MainActor
+    private func awaitDelivery(at index: Int, from handler: RecordingHandler) async throws -> ActionResult {
+        let deadline = Date().addingTimeInterval(3.0)
+        while handler.results.count <= index && Date() < deadline {
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertGreaterThan(handler.results.count, index, "effect delivery did not reach the handler at index \(index)")
+        return handler.results[index]
+    }
+
+    /// Polls `toast.isLoading` until it clears or the deadline passes; state-based, not a fixed sleep, so it is not flaky.
     @MainActor
     private func awaitLoadingFade(toast: ToastPanelController) async {
         let deadline = Date().addingTimeInterval(3.0)
@@ -351,8 +392,7 @@ final class ActionResultDeliveryTests: XCTestCase {
         }
     }
 
-    /// Polls the toast until it shows `message` or the deadline passes — waits for an action's
-    /// async `perform` to settle a `.toast` before the test proceeds.
+    /// Polls until the toast shows `message` or the deadline passes, so `perform` can settle first.
     @MainActor
     private func awaitToastMessage(_ toast: ToastPanelController, _ message: String) async {
         let deadline = Date().addingTimeInterval(3.0)
@@ -366,23 +406,22 @@ final class ActionResultDeliveryTests: XCTestCase {
                                  pasteProbe: PasteAvailabilityProbing,
                                  appPolicy: AppPolicyContext,
                                  toastController: ToastPanelController = ToastPanelController(),
-                                 settingsStore: SettingsStore = MemorySettingsStore()) -> PopupWindowController {
+                                 settingsStore: SettingsStore = MemorySettingsStore(),
+                                 source: SelectionSource = .selection) -> PopupWindowController {
         let controller = PopupWindowController(resultHandler: resultHandler, pasteProbe: pasteProbe, toastController: toastController, settingsStore: settingsStore)
         let context = SelectionContext(
             text: "hello",
             sourceApp: AppIdentity(bundleIdentifier: "com.test", localizedName: "Test"),
             cursorPosition: CGPoint(x: 300, y: 300),
             timestamp: Date(),
-            appPolicy: appPolicy
+            appPolicy: appPolicy,
+            source: source
         )
         controller.startTestSession(for: context)
         return controller
     }
 
-    /// Regression: a `.paste` result dismisses the popup, and `hide()` clears the live session
-    /// context. The denyPaste policy must be captured BEFORE that hide — otherwise the Terminal
-    /// escape hatch silently pastes instead of copying. The policy answers inside the unified
-    /// decision (no probe consulted), so the "would happily paste" probe is overridden by the rule.
+    /// Regression: a `.paste` dismisses the popup and `hide()` clears the session. Policy must be captured before that hide, or the Terminal escape hatch pastes instead of copying.
     @MainActor
     func testDeliverResultAppliesDenyPasteDespiteDismissingHide() async throws {
         let handler = RecordingHandler()
@@ -397,8 +436,7 @@ final class ActionResultDeliveryTests: XCTestCase {
         assertCase(try await awaitDelivery(from: handler), .copy("hello"))
     }
 
-    /// A nil delivery context (an explicit user request, e.g. the AI card's Paste button) must never
-    /// be re-decided — even when the probe would say paste is unavailable.
+    /// A nil delivery context (explicit user request, e.g. the AI card's Paste button) is never re-decided, even if the probe says paste is unavailable.
     @MainActor
     func testNilDeliveryPassesPasteThroughUntouched() async throws {
         let handler = RecordingHandler()
@@ -414,8 +452,7 @@ final class ActionResultDeliveryTests: XCTestCase {
 
     // MARK: - Implicit .text delivery wiring (defaults preserved)
 
-    /// Default settings (primary = paste): an implicit `.text` result delivers a paste and dismisses
-    /// the popup — identical to today's string-return behavior.
+    /// Default primary = paste: an implicit `.text` result pastes and dismisses, as the string-return behavior does.
     @MainActor
     func testTextDeliversPasteAndDismissesWithDefaultSettings() async throws {
         let handler = RecordingHandler()
@@ -484,13 +521,52 @@ final class ActionResultDeliveryTests: XCTestCase {
         XCTAssertFalse(controller.isVisible)
     }
 
+    @MainActor
+    func testOCRDirectSecondaryCutIsCopied() async throws {
+        let handler = RecordingHandler()
+        let controller = shownController(resultHandler: handler, pasteProbe: FixedProbe(result: true), appPolicy: .default, source: .ocr)
+        defer { controller.hide() }
+
+        controller.runAction(TextStubAction(result: .cut("recognized")), with: controllerCurrentContext(controller, source: .ocr), isSecondaryClick: true)
+
+        assertCase(try await awaitDelivery(from: handler), .copy("recognized"))
+    }
+
+    @MainActor
+    func testOCRDirectSimulatePasteIsDropped() async throws {
+        let handler = RecordingHandler()
+        let controller = shownController(resultHandler: handler, pasteProbe: FixedProbe(result: true), appPolicy: .default, source: .ocr)
+        defer { controller.hide() }
+
+        controller.runAction(TextStubAction(result: .simulatePaste), with: controllerCurrentContext(controller, source: .ocr), isSecondaryClick: true)
+
+        assertCase(try await awaitDelivery(from: handler), .none)
+    }
+
+    @MainActor
+    func testOCRDeclaredSecondarySequenceAndLoadingResultAreNormalized() async throws {
+        let handler = RecordingHandler()
+        let controller = shownController(resultHandler: handler, pasteProbe: FixedProbe(result: true), appPolicy: .default, source: .ocr)
+        defer { controller.hide() }
+
+        let action = TextStubAction(
+            result: .success,
+            delivery: ActionDelivery(secondary: .sequence([.cut("one"), .simulatePaste, .copy("two")]))
+        )
+        controller.runAction(action, with: controllerCurrentContext(controller, source: .ocr), isSecondaryClick: true)
+        assertCase(try await awaitDelivery(at: 0, from: handler), .copy("one"))
+        assertCase(try await awaitDelivery(at: 1, from: handler), .none)
+        assertCase(try await awaitDelivery(at: 2, from: handler), .copy("two"))
+
+        let loadingController = shownController(resultHandler: handler, pasteProbe: FixedProbe(result: true), appPolicy: .default, source: .ocr)
+        defer { loadingController.hide() }
+        loadingController.runLoadingAction(SlowResultStubAction(result: .cut("loaded")), with: controllerCurrentContext(loadingController, source: .ocr), isSecondaryClick: false)
+        assertCase(try await awaitDelivery(at: 3, from: handler), .copy("loaded"))
+    }
+
     // MARK: - Builtin explicit paste/copy never governed by the picker (controller level)
 
-    /// Builtins author explicit outcomes (Copy/Cut/Paste/Calculate/Completion). Even with
-    /// recommendedResult set to `.preview`, an explicit `.paste` must be delivered as authored (probe
-    /// still applies) and dismiss — never routed to the AI result card. Guards the spec's "the
-    /// picker never fights an explicit effect" contract at the controller seam, where the `.text`
-    /// preview branch could otherwise shadow a future regression.
+    /// Builtins author explicit outcomes; an explicit `.paste` is delivered as authored and dismisses, never routed to the AI card.
     @MainActor
     func testExplicitPasteDeliversNotPreviewedWithPreviewPreference() async throws {
         let handler = RecordingHandler()
@@ -535,9 +611,7 @@ final class ActionResultDeliveryTests: XCTestCase {
 
     // MARK: - Preview routing (implicit .text → AI result card)
 
-    /// Preview preference on a primary click keeps the popup open and renders the returned text in
-    /// the native AI result card (content mode) with the performing action's title — no effect is
-    /// delivered to the handler.
+    /// Preview preference on a primary click keeps the popup open and renders the text in the AI result card; no effect is delivered.
     @MainActor
     func testTextPreviewKeepsPopupOpenAndShowsCard() async throws {
         let handler = RecordingHandler()
@@ -691,9 +765,7 @@ final class ActionResultDeliveryTests: XCTestCase {
 
     // MARK: - Preview routing review follow-ups (declared secondary + pending-state leak)
 
-    /// A declared secondary beats the picker even when the raw result is `.text` with a preview
-    /// preference: the popup must dismiss with the declared outcome (e.g. openURL), not stay open
-    /// for a card that never renders. `shouldDismiss` verifies the actual resolved outcome.
+    /// A declared secondary beats the picker even for `.text` with a preview preference: the popup must dismiss with the declared outcome.
     @MainActor
     func testTextPreviewWithDeclaredSecondaryDismisses() async throws {
         let handler = RecordingHandler()
@@ -712,10 +784,7 @@ final class ActionResultDeliveryTests: XCTestCase {
         XCTAssertFalse(controller.isVisible, "a dismissing declared secondary must dismiss even when the raw .text preference is preview")
     }
 
-    /// The right-click perform path (runAction) snapshots the action's declared delivery into its
-    /// own DeliveryContext and must not leave `pendingActionTitle`/`pendingDelivery` behind for a
-    /// later completion-paste `deliverResult` — the preview card's title comes from the snapshotted
-    /// context, and the completion paste must fire no stale declared toast.
+    /// The right-click path snapshots the declared delivery into its own context and must not leave pending state for a later completion paste to reuse.
     @MainActor
     func testRunActionPreviewDoesNotLeakDeclaredDeliveryOntoCompletionPaste() async throws {
         let handler = RecordingHandler()
@@ -777,8 +846,7 @@ final class ActionResultDeliveryTests: XCTestCase {
 
     // MARK: - Toast routing: paste→copy downgrade shows "Copied"; native copy shows nothing
 
-    /// A `.paste` result downgraded to `.copy` (secondary click / cannot paste) surfaces the
-    /// "Copied" toast. The toast is independent of the popup, so it works even though the popup hid.
+    /// A `.paste` downgraded to `.copy` surfaces the "Copied" toast, independent of the popup.
     @MainActor
     func testDowngradeToCopyShowsCopiedToast() async throws {
         let handler = RecordingHandler()
@@ -834,9 +902,7 @@ final class ActionResultDeliveryTests: XCTestCase {
         XCTAssertEqual(toast.currentFeedback?.message, String(localized: "Copied"))
     }
 
-    /// Every `.toast` result routes to the toast (the single status surface). A test session has
-    /// no panel window (`startTestSession` creates none), so the toast falls back to deterministic
-    /// main-screen centering — the contract forbids any pointer fallback.
+    /// Every `.toast` routes to the toast surface; with no panel, the toast uses cursor-relative placement.
     @MainActor
     func testToastRoutesToToast() async throws {
         let toast = ToastPanelController()
@@ -851,9 +917,7 @@ final class ActionResultDeliveryTests: XCTestCase {
         XCTAssertNil(toast.lastAnchorFrame, "no panel frame exists in a test session; must not invent a cursor anchor")
     }
 
-    /// An auto-dismissing toast holds while the pointer is on it. Dismissible toasts accept pointer
-    /// events (so hover can fire) rather than fully passing through; interactive/keep-visible toasts
-    /// keep their existing pass-through rules.
+    /// An auto-dismissing toast holds while hovered; dismissible toasts accept pointer events so hover can fire.
     @MainActor
     func testToastHoverSuspendsAutoDismissal() async throws {
         let toast = ToastPanelController(autoDismissNanoseconds: 80_000_000)
@@ -894,8 +958,7 @@ final class ActionResultDeliveryTests: XCTestCase {
 
     // MARK: - Loading (slow-action) early-close flow
 
-    /// A `showsLoading` action closes the popup immediately, shows a spinner toast, and fades the
-    /// toast when the result lands with no description (`.success`).
+    /// A `showsLoading` action closes the popup, shows a spinner, and fades the toast when the result lands with no description.
     @MainActor
     func testLoadingActionShowsSpinnerThenFades() async throws {
         let handler = RecordingHandler()
@@ -913,19 +976,19 @@ final class ActionResultDeliveryTests: XCTestCase {
     }
 
     @MainActor
-    private func controllerCurrentContext(_ controller: PopupWindowController) -> ActionContext {
+    private func controllerCurrentContext(_ controller: PopupWindowController, source: SelectionSource = .selection) -> ActionContext {
         let context = SelectionContext(
             text: "hello",
             sourceApp: AppIdentity(bundleIdentifier: "com.test", localizedName: "Test"),
             cursorPosition: CGPoint(x: 300, y: 300),
             timestamp: Date(),
-            appPolicy: .default
+            appPolicy: .default,
+            source: source
         )
         return ActionContext(selection: context, modifiers: [])
     }
 
-    /// A `showsLoading` action with an explicit `loadingMessage`; the controller must surface that
-    /// message verbatim instead of the "Opening <title>…" default.
+    /// A loading action's explicit `loadingMessage` is shown verbatim, not the default "Opening <title>…" text.
     @MainActor
     func testLoadingActionUsesCustomLoadingMessage() async throws {
         let handler = RecordingHandler()
@@ -943,8 +1006,7 @@ final class ActionResultDeliveryTests: XCTestCase {
         XCTAssertFalse(toast.isLoading, "loading toast should fade once a description-free result lands")
     }
 
-    /// When a loading action returns a toast declaring `keepVisible: true`, the settled toast must
-    /// still auto-dismiss because the popup was already closed when loading started.
+    /// A settled keep-visible toast must still auto-dismiss, since the popup was closed when loading started.
     @MainActor
     func testLoadingActionKeepVisibleToastAutoDismisses() async throws {
         let handler = RecordingHandler()
@@ -981,8 +1043,7 @@ final class ActionResultDeliveryTests: XCTestCase {
         XCTAssertFalse(toast.isShowing, "hide() must dismiss any keepVisible toast")
     }
 
-    /// Clicking cancel (or calling cancelActiveTasks) while a loading action is running
-    /// cancels the active task and hides the toast without showing an error banner.
+    /// Cancel while loading cancels the task and hides the toast without an error banner.
     @MainActor
     func testLoadingActionCancellationDismissesToastWithoutError() async throws {
         let handler = RecordingHandler()
@@ -1011,9 +1072,7 @@ final class ActionResultDeliveryTests: XCTestCase {
 
     // MARK: - Secondary-click threading: runAction must propagate the click intent into the action context
 
-    /// A right-click (secondary click) on an action must reach `perform` as
-    /// `context.isSecondaryClick == true`, so Define returns `.copyDefinition` instead of opening
-    /// Dictionary.
+    /// A secondary click must reach `perform` as `isSecondaryClick == true`, so Define copies instead of opening Dictionary.
     @MainActor
     func testRunActionThreadsSecondaryClickIntoActionContext() async throws {
         let handler = RecordingHandler()
@@ -1047,11 +1106,7 @@ final class ActionResultDeliveryTests: XCTestCase {
 
     // MARK: - Explicit click intent: the palette's keyboard secondary reaches the delivery snapshot
 
-    /// Regression: the scoped/group palette signals a secondary run with its own `replace` flag
-    /// (⇧⏎ and the ⇧⏎ footer badge), which never reaches the mouse monitor's `pendingClickIntent`.
-    /// The intent is now passed explicitly into `deliverySnapshot(for:clickIntent:)`, so a keyboard
-    /// secondary run of a `.paste` primary delivers a copy. Before the fix the snapshot fell back to
-    /// the pending (primary) intent and pasted.
+    /// Regression: the palette's keyboard secondary signals via its own `replace` flag, not `pendingClickIntent`, so the intent is passed explicitly into the snapshot.
     @MainActor
     func testExplicitSecondaryIntentSnapshotCopiesPasteResult() async throws {
         let handler = RecordingHandler()
@@ -1075,9 +1130,7 @@ final class ActionResultDeliveryTests: XCTestCase {
 
     // MARK: - Declared delivery wiring: runAction must snapshot the action's delivery and render its toast
 
-    /// An action declaring a distinct secondary outcome + secondary toast: a secondary (right-click)
-    /// perform must deliver the declared secondary and surface the declared toast — the controller
-    /// snapshots `action.delivery` and renders the resolved tuple's toast.
+    /// A declared secondary outcome and toast: a right-click perform delivers the declared secondary and surfaces its toast.
     @MainActor
     func testRunActionDeliversDeclaredSecondaryAndToast() async throws {
         let handler = RecordingHandler()
@@ -1097,8 +1150,7 @@ final class ActionResultDeliveryTests: XCTestCase {
         XCTAssertEqual(toast.currentFeedback, declared, "the declared secondary toast must surface for a secondary click")
     }
 
-    /// An action declaring a primary toast: a primary perform must surface it even when the result
-    /// itself is a description-free `.success` (the toast is not tied to a paste→copy downgrade).
+    /// A declared primary toast surfaces even for a description-free `.success` (not tied to a paste→copy downgrade).
     @MainActor
     func testRunActionShowsDeclaredPrimaryToast() async throws {
         let handler = RecordingHandler()
@@ -1119,11 +1171,7 @@ final class ActionResultDeliveryTests: XCTestCase {
 
     // MARK: - Single-use declared delivery: a completion paste must not reuse a prior action's declaration
 
-    /// Completion buttons route `deliverResult(.paste(word))` straight in (PopupView `onResult`),
-    /// bypassing `onWillPerformAction`. Model the left-click bar flow: the prior action's declared
-    /// delivery is snapshotted into `pendingDelivery`, its dismissing `.toast` result
-    /// routes through `deliverResult` (which consumes and clears the declaration), and the
-    /// completion-word paste that follows must carry no declared secondary and fire no stale toast.
+    /// A completion paste after a prior action's `.toast` dismissal carries no declared secondary and fires no stale toast; the declaration is consumed on delivery.
     @MainActor
     func testStaleDeclaredDeliveryDoesNotLeakOntoCompletionPaste() async throws {
         let handler = RecordingHandler()
@@ -1150,9 +1198,7 @@ final class ActionResultDeliveryTests: XCTestCase {
 
     // MARK: - One toast per run: a script toast wins over the delivery companion
 
-    /// A top-level sequence carrying a script toast suppresses the delivery companion for its
-    /// effects: even with a declared primary toast snapshotted onto the delivery, a `.copy` effect
-    /// must not surface the declared toast — the script toast wins (one toast per run).
+    /// A script toast suppresses the delivery companion toast: a declared primary toast must not surface for a `.copy` effect (one toast per run).
     @MainActor
     func testScriptToastWinsOverDeclaredToast() async throws {
         let handler = RecordingHandler()
@@ -1172,9 +1218,7 @@ final class ActionResultDeliveryTests: XCTestCase {
                        "the script toast must win over the declared delivery companion")
     }
 
-    /// A top-level sequence carrying a script toast suppresses the delivery companion for its
-    /// effects: the paste→copy downgrade's default "Copied" toast must not surface alongside the
-    /// script toast (one toast per run).
+    /// Same rule for the paste→copy downgrade: its default "Copied" toast must not show alongside a script toast.
     @MainActor
     func testScriptToastSuppressesDefaultCopiedToast() async throws {
         let handler = RecordingHandler()
@@ -1212,8 +1256,7 @@ final class ActionResultDeliveryTests: XCTestCase {
         assertCase(handler.results[1], .copy("b"))
     }
 
-    /// A declared secondary replaces a sequence once. Walking the leaves with the same
-    /// DeliveryContext would execute that secondary once per item.
+    /// A declared secondary replaces a sequence once; walking leaves with the same context would run it per item.
     @MainActor
     func testDeclaredSecondaryOnSequenceExecutesOnce() async throws {
         let handler = RecordingHandler()
@@ -1258,8 +1301,7 @@ final class ActionResultDeliveryTests: XCTestCase {
         XCTAssertEqual(handler.results.count, 1, "declared secondary must run once on the loading sequence path")
     }
 
-    /// A declared `.sequence` secondary (not produced by manifests today) must not recurse: the
-    /// nested walk clears the declaration and runs the declared items in order.
+    /// A declared `.sequence` secondary must not recurse; the nested walk clears the declaration and runs items in order.
     @MainActor
     func testDeclaredSequenceSecondaryDoesNotRecurse() async throws {
         let handler = RecordingHandler()
@@ -1283,10 +1325,7 @@ final class ActionResultDeliveryTests: XCTestCase {
 
     // MARK: - Greptile review regression tests: feedback preservation & declared sequence paste
 
-    /// Issue 1: When a primary perform returns a sequence containing a toast, and a secondary
-    /// click has a declared outcome with `secondaryToast`, suppression must be based on the outcome
-    /// that actually runs. The declared outcome's `secondaryToast` must not be suppressed by the
-    /// discarded primary toast.
+    /// Suppression must follow the outcome that actually runs: a declared secondary's toast is not suppressed by a discarded primary toast.
     @MainActor
     func testDiscardedPrimarySequenceToastDoesNotSuppressDeclaredSecondaryToast() async throws {
         let handler = RecordingHandler()
@@ -1312,9 +1351,7 @@ final class ActionResultDeliveryTests: XCTestCase {
                        "the declared secondary toast must not be suppressed by the discarded primary sequence toast")
     }
 
-    /// Issue 1 (loading path): When a loading action returns a sequence containing a toast and the
-    /// secondary click replaces it with an outcome without a companion toast, the spinner must fade
-    /// (not get stuck showing) because suppression is based on the outcome that actually runs.
+    /// Loading path: a secondary replacing a toast-containing sequence with an outcome lacking a companion toast must still fade the spinner.
     @MainActor
     func testDiscardedPrimarySequenceToastDoesNotLeaveLoadingSpinnerOnSecondaryClick() async throws {
         let handler = RecordingHandler()
@@ -1339,9 +1376,7 @@ final class ActionResultDeliveryTests: XCTestCase {
         XCTAssertFalse(toast.isLoading, "the loading indicator must fade when the running outcome has no companion toast")
     }
 
-    /// Issue 1 (loading path with secondaryToast): When a loading action returns a sequence
-    /// containing a toast and the secondary click replaces it with an outcome that declares
-    /// `secondaryToast`, the spinner transitions to that declared toast.
+    /// Loading path: the spinner transitions to the declared `secondaryToast` of the replacing outcome.
     @MainActor
     func testDiscardedPrimarySequenceToastPreservesDeclaredSecondaryToastOnLoading() async throws {
         let handler = RecordingHandler()
@@ -1368,9 +1403,7 @@ final class ActionResultDeliveryTests: XCTestCase {
                        "the declared secondary toast must surface for loading action secondary click")
     }
 
-    /// Issue 2: A declared secondary that is a sequence containing `.paste` must NOT have that
-    /// paste converted to `.copy` when the target can paste. The author explicitly declared `.paste`
-    /// as the secondary outcome.
+    /// A declared secondary sequence containing `.paste` keeps the `.paste` when the target can paste (not converted to `.copy`).
     @MainActor
     func testDeclaredSequenceSecondaryPastesWhenCanPaste() async throws {
         let handler = RecordingHandler()
@@ -1392,8 +1425,7 @@ final class ActionResultDeliveryTests: XCTestCase {
         assertCase(handler.results[1], .openURL(url))
     }
 
-    /// Issue 2 (cannot paste): If the declared sequence contains `.paste` but the target cannot paste,
-    /// the probe still downgrades `.paste` to `.copy`.
+    /// If the target cannot paste, the probe still downgrades a declared sequence's `.paste` to `.copy`.
     @MainActor
     func testDeclaredSequenceSecondaryDowngradesToCopyWhenCannotPaste() async throws {
         let handler = RecordingHandler()
@@ -1415,8 +1447,7 @@ final class ActionResultDeliveryTests: XCTestCase {
         assertCase(handler.results[1], .openURL(url))
     }
 
-    /// Issue 2 (loading path): A declared secondary sequence containing `.paste` on the loading
-    /// settle path also preserves `.paste` when paste is available.
+    /// Loading path: a declared secondary sequence's `.paste` is also preserved when paste is available.
     @MainActor
     func testDeclaredLoadingSequenceSecondaryPastesWhenCanPaste() async throws {
         let handler = RecordingHandler()
@@ -1444,9 +1475,7 @@ final class ActionResultDeliveryTests: XCTestCase {
     // MARK: - Declared .paste secondary probes even on a secondary click
 
 
-    /// A declared `.paste` secondary is pasted on a secondary click: the probe must still run (the
-    /// force-copy short-circuit only applies when the click's outcome is a copy). With paste
-    /// available the declared paste secondary is delivered as a paste, not downgraded to copy.
+    /// A declared `.paste` secondary on a secondary click still runs the probe; with paste available it is delivered as a paste.
     @MainActor
     func testDeclaredPasteSecondaryPastesOnSecondaryClickWhenCanPaste() async throws {
         let handler = RecordingHandler()
@@ -1461,8 +1490,7 @@ final class ActionResultDeliveryTests: XCTestCase {
         assertCase(try await awaitDelivery(from: handler), .paste("alt"))
     }
 
-    /// The same declared `.paste` secondary on a secondary click, but the target cannot paste: the
-    /// probe runs (and answers no), downgrading the declared paste to a copy — never paste blindly.
+    /// Same declared `.paste` secondary, target cannot paste: the probe downgrades it to copy, never pastes blindly.
     @MainActor
     func testDeclaredPasteSecondaryDowngradesToCopyWhenCannotPaste() async throws {
         let handler = RecordingHandler()
@@ -1485,8 +1513,7 @@ final class ActionResultDeliveryTests: XCTestCase {
                      "DefineAction must rely on the default nil delivery (picker-governed)")
     }
 
-    /// PasteAction relies on the default nil delivery: the resolver derives `.copy` for a secondary
-    /// click and shows the default "Copied" toast. Builtins and extensions behave identically.
+    /// PasteAction uses the default nil delivery; the resolver derives `.copy` for a secondary click.
     func testPasteDeclaresNoDelivery() {
         XCTAssertNil(PasteAction().delivery,
                      "PasteAction must rely on the default nil delivery (paste→copy default)")
@@ -1535,6 +1562,112 @@ final class ActionResultDeliveryTests: XCTestCase {
         // Must downgrade to .copy to avoid pasting into the wrong application
         assertCase(delivered, .copy("unsafe paste"))
         await awaitToastMessage(toast, String(localized: "Copied"))
+    }
+
+    @MainActor
+    func testFieldChangeBeforeAsyncActionFinishesCopiesInsteadOfPasting() async throws {
+        let handler = RecordingHandler()
+        let controller = shownController(resultHandler: handler, pasteProbe: FixedProbe(result: true), appPolicy: .default)
+        let target = DeliveryTestApp(pid: 90001)
+        controller.previousFrontmostApp = target
+        controller.frontmostApplicationProvider = { target }
+        var fieldIsCurrent = true
+        controller.selectionIsCurrent = { _ in fieldIsCurrent }
+        controller.runAction(SlowPasteStubAction(text: "late result"),
+                             with: controllerCurrentContext(controller), isSecondaryClick: false)
+        fieldIsCurrent = false
+        assertCase(try await awaitDelivery(from: handler), .copy("late result"))
+        XCTAssertEqual(controller.lastDeliveryStatus, .targetChanged)
+    }
+
+    @MainActor
+    func testStaleEditableSelectionIsRejectedBeforeActionRuns() {
+        let handler = RecordingHandler()
+        let controller = PopupWindowController(
+            resultHandler: handler,
+            pasteProbe: FixedProbe(result: true),
+            settingsStore: MemorySettingsStore()
+        )
+        let selection = SelectionContext(
+            text: "word",
+            sourceApp: AppIdentity(bundleIdentifier: "com.test", localizedName: "Test"),
+            cursorPosition: .zero,
+            timestamp: Date(),
+            appPolicy: .default,
+            selectionGeneration: 7,
+            isEditable: true
+        )
+        controller.startTestSession(for: selection)
+        controller.selectionIsCurrent = { _ in false }
+        let action = KeyPressAction(
+            id: "com.test.bold",
+            title: "Bold",
+            spec: KeyPressSpec(manifestString: "command+b")!,
+            chrome: ActionChrome(requiresLiveSelection: true),
+            rules: ExtensionActionRules(requirements: ActionRequirements(input: .editableSelection))
+        )
+
+        controller.runAction(action, with: controller.currentActionContext!, isSecondaryClick: false)
+        XCTAssertTrue(handler.results.isEmpty)
+        controller.hide()
+    }
+
+    @MainActor
+    func testRequiredPasteTargetResultIsDroppedAfterTargetApplicationSwitches() async throws {
+        let handler = RecordingHandler()
+        let probe = SwitchingTargetProbe()
+        let controller = PopupWindowController(
+            resultHandler: handler,
+            pasteProbe: probe,
+            settingsStore: MemorySettingsStore()
+        )
+        let target = DeliveryTestApp(pid: 90001)
+        let other = DeliveryTestApp(pid: 90002)
+        controller.previousFrontmostApp = target
+        controller.frontmostApplicationProvider = { probe.switched ? other : target }
+        controller.startTestSession(for: SelectionContext(
+            text: "hello",
+            sourceApp: AppIdentity(bundleIdentifier: "com.test", localizedName: "Test"),
+            appPolicy: .default
+        ), pasteAvailable: true)
+        let action = SlowResultStubAction(
+            result: .paste("stale destination"),
+            rules: ExtensionActionRules(requirements: ActionRequirements(input: .optional, requiresPasteTarget: true))
+        )
+
+        controller.runAction(action, with: controller.currentActionContext!, isSecondaryClick: false)
+
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertTrue(probe.switched, "the result should wait for its paste probe")
+        XCTAssertTrue(handler.results.isEmpty, "a destination-bound action result must not dispatch after its target app changes during the probe")
+        controller.hide()
+    }
+
+    @MainActor
+    func testFieldChangeWhilePasteProbeSuspendsCopiesInsteadOfPasting() async throws {
+        let handler = RecordingHandler()
+        let probe = SwitchingTargetProbe()
+        let controller = shownController(resultHandler: handler, pasteProbe: probe, appPolicy: .default)
+        let target = DeliveryTestApp(pid: 90001)
+        controller.previousFrontmostApp = target
+        controller.frontmostApplicationProvider = { target }
+        controller.selectionIsCurrent = { _ in !probe.switched }
+        controller.deliverResult(.paste("late result"))
+        assertCase(try await awaitDelivery(from: handler), .copy("late result"))
+        XCTAssertEqual(controller.lastDeliveryStatus, .targetChanged)
+    }
+
+    @MainActor
+    func testAppSwitchWhilePasteProbeSuspendsDowngradesToCopy() async throws {
+        let handler = RecordingHandler()
+        let probe = SwitchingTargetProbe()
+        let controller = shownController(resultHandler: handler, pasteProbe: probe, appPolicy: .default)
+        let target = DeliveryTestApp(pid: 90001)
+        let other = DeliveryTestApp(pid: 90002)
+        controller.previousFrontmostApp = target
+        controller.frontmostApplicationProvider = { probe.switched ? other : target }
+        controller.deliverResult(.paste("safe text"))
+        assertCase(try await awaitDelivery(from: handler), .copy("safe text"))
     }
 
     @MainActor
@@ -1604,8 +1737,7 @@ private final class SlowPasteStubAction: Action, @unchecked Sendable {
     }
 }
 
-/// Records every effect the handler is asked to deliver. @MainActor-isolated, matching the
-/// `ActionResultHandler` protocol's main-actor methods.
+/// Records every effect the handler is asked to deliver; main-actor isolated like the `ActionResultHandler` protocol.
 @MainActor
 private final class RecordingHandler: ActionResultHandler, Sendable {
     private(set) var results: [ActionResult] = []
@@ -1648,8 +1780,7 @@ private struct DelayedProbe: PasteAvailabilityProbing {
     }
 }
 
-/// A `showsLoading` action whose perform resolves after a short delay to a description-free
-/// `.success` (e.g. Apple Music's empty-stdout AppleScript).
+/// A `showsLoading` action resolving after a delay to a description-free `.success` (like an empty-stdout AppleScript).
 private final class SlowStubAction: Action {
     let id = "stub.slow"
     let title = "Slow"
@@ -1691,9 +1822,7 @@ private final class KeepVisibleToastLoadingAction: Action {
     }
 }
 
-/// Records the `ActionContext` handed to `perform` so tests can assert the click intent
-/// (isSecondaryClick) threaded through the controller's run path. Mutable state lives in a
-/// synchronous lock-protected box so the Sendable `Action` conformance stays race-free.
+/// Records the `ActionContext` passed to `perform` so tests can assert click intent; lock-protected so the Sendable conformance stays race-free.
 private final class SecondaryClickProbeAction: Action, @unchecked Sendable {
     let id = "stub.secondary"
     let title = "SecondaryClickProbe"
@@ -1709,9 +1838,7 @@ private final class SecondaryClickProbeAction: Action, @unchecked Sendable {
     }
 }
 
-/// An action carrying a declared `delivery` (secondary outcome + per-click toasts). Its default
-/// perform returns a plain `.paste`, so a secondary click derives the declared secondary rather
-/// than copying; `performResult` lets tests exercise non-paste results too.
+/// Declares a `delivery` (secondary outcome + per-click toasts); `performResult` lets tests exercise non-paste results.
 private final class DeclaredDeliveryStub: Action, @unchecked Sendable {
     let id = "stub.declared"
     let title = "Declared"
@@ -1733,18 +1860,43 @@ private final class DeclaredDeliveryStub: Action, @unchecked Sendable {
     func perform(_ context: ActionContext) async throws -> ActionResult { performResult }
 }
 
-/// An action whose perform returns implicitly returned text (a `.text` result), like the JS string
-/// return / AppleScript output / shell stdout / text snippet runtimes.
+/// Returns implicit `.text`, like JS string returns, AppleScript output, shell stdout, and text snippets.
 private final class TextStubAction: Action, @unchecked Sendable {
     let id = "stub.text"
     let title = "Text Action"
     let icon: ActionIcon = .symbol("text.alignleft")
     var chrome: ActionChrome { ActionChrome(source: .builtin) }
+    private let deliveryValue: ActionDelivery?
     private let result: ActionResult
-    init(result: ActionResult = .text("hello")) { self.result = result }
+    init(result: ActionResult = .text("hello"), delivery: ActionDelivery = .none) {
+        self.result = result
+        self.deliveryValue = delivery.secondary == nil && delivery.primaryToast == nil && delivery.secondaryToast == nil
+            ? nil
+            : delivery
+    }
+    var delivery: ActionDelivery? { deliveryValue }
     func isEnabled(for context: ActionContext) -> Bool { true }
     func matchInfo(for context: ActionContext) -> ActionMatchInfo? { nil }
     func perform(_ context: ActionContext) async throws -> ActionResult { result }
+}
+
+private final class SlowResultStubAction: ActionWithRules, @unchecked Sendable {
+    let id = "stub.slowresult"
+    let title = "Slow Result"
+    let icon: ActionIcon = .symbol("text.alignleft")
+    var chrome: ActionChrome { ActionChrome(source: .builtin, showsLoading: true) }
+    private let result: ActionResult
+    let rules: ExtensionActionRules?
+    init(result: ActionResult, rules: ExtensionActionRules? = nil) {
+        self.result = result
+        self.rules = rules
+    }
+    func isEnabled(for context: ActionContext) -> Bool { true }
+    func matchInfo(for context: ActionContext) -> ActionMatchInfo? { nil }
+    func perform(_ context: ActionContext) async throws -> ActionResult {
+        try await Task.sleep(nanoseconds: 30_000_000)
+        return result
+    }
 }
 
 /// A `showsLoading` action returning `.text` after a short delay (loading + preview re-show path).
@@ -1767,8 +1919,7 @@ private final class SlowTextStubAction: Action, @unchecked Sendable {
     }
 }
 
-/// Lock-protected capture box for the context an action performed with (synchronous accessors, so
-/// it stays callable from an async `perform`).
+/// Lock-protected capture of the context an action performed with; synchronous so it is callable from async `perform`.
 private final class LockedContextBox: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: ActionContext?
@@ -1780,4 +1931,21 @@ private final class LockedContextBox: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return storage
     }
+}
+
+@MainActor
+private final class SwitchingTargetProbe: PasteAvailabilityProbing {
+    var switched = false
+    func canPaste(in app: NSRunningApplication?, policy: AppPolicyContext) async -> Bool? {
+        await Task.yield()
+        switched = true
+        return true
+    }
+}
+
+private final class DeliveryTestApp: NSRunningApplication {
+    private let pid: pid_t
+    init(pid: pid_t) { self.pid = pid; super.init() }
+    override var processIdentifier: pid_t { pid }
+    override var bundleIdentifier: String? { "com.test.delivery" }
 }

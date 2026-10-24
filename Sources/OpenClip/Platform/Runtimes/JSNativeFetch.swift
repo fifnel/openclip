@@ -2,92 +2,89 @@
 // OpenClip
 //
 // Shared URLSession-backed fetch bridge for the JavaScript runtime. Installs
-// `openclip.__nativeFetch` (a URLSession dataTask) and the `openclip.fetch`
-// polyfill into any JSContext that already exposes a global `openclip` object.
-// OpenClipJSHost (async JS actions) calls installNativeFetch after installing its
-// own bridge; tests route through an injected URLSession with MockURLProtocol.
+// `openclip.__nativeFetch` and the `openclip.fetch` polyfill into a JSContext
+// that already has a global `openclip` object.
 import Foundation
 import JavaScriptCore
 import Darwin
 import Core
 
 enum JSNativeFetch {
-    /// Installs `openclip.__nativeFetch` + the `openclip.fetch` polyfill. The
-    /// context must already have a global `openclip` object (both hosts set it
-    /// before calling). All JS VM access stays on the thread that created the
-    /// context: the URLSession completion only schedules work back onto that
-    /// thread's CFRunLoop; the host's pump loop drains it.
-    static func installNativeFetch(in context: JSContext, session: URLSession, fetchTasks: FetchTaskBox) {
+    /// Installs `openclip.__nativeFetch` and the `openclip.fetch` polyfill. All JS VM access
+    /// stays on the context's creating thread; URLSession completions only schedule work onto its CFRunLoop.
+    @discardableResult
+    static func installNativeFetch(in context: JSContext, session: URLSession, fetchTasks: FetchTaskBox) -> FetchResolvers? {
         guard let openclip = context.objectForKeyedSubscript("openclip" as NSString),
-              !openclip.isUndefined, !openclip.isNull, openclip.isObject else { return }
+              !openclip.isUndefined, !openclip.isNull, openclip.isObject else { return nil }
 
-        let contextBox = JSContextBox(context)
-        // runLoopBox keeps CFRunLoopGetCurrent() out of the block's @Sendable
-        // capture region (region-based isolation checker).
+        // Weak so the block on `openclip` does not retain the context (issue #47).
+        let weakContextBox = WeakJSContextBox(context)
+        // Resolvers stay on this JS thread; the off-thread completion reaches them only via a weak box.
+        let resolvers = FetchResolvers()
+        // Boxed so CFRunLoopGetCurrent() stays out of the @Sendable capture region.
         let runLoopBox = RunLoopBox(CFRunLoopGetCurrent())
-        // Rebuild the injected session with a redirect-intercepting delegate so every hop is
-        // validated before URLSession follows it, while keeping the caller's configuration
-        // (notably the MockURLProtocol classes used in tests).
+        // Rebuilt with a redirect-validating delegate, keeping the caller's configuration (e.g. MockURLProtocol in tests).
         let policySession = PolicySession(from: session)
+        // Invalidate at run end so the session, delegate, and Mach ports are released (issue #46).
+        fetchTasks.setCloseHandler { policySession.session.invalidateAndCancel() }
 
         let nativeFetchBlock: @convention(block) (String, JSValue, JSValue, JSValue) -> Void = { urlString, options, resolve, reject in
             guard let url = URL(string: urlString) else {
-                guard let err = JSNativeFetch.jsError("Invalid URL: \(urlString)", in: context) else { return }
+                guard let currentContext = JSContext.current(),
+                      let err = JSNativeFetch.jsError("Invalid URL: \(urlString)", in: currentContext) else { return }
                 reject.call(withArguments: [err])
                 return
             }
-            // Enforce the destination policy on the initial URL: http/https only, and never a
-            // loopback with an unallowed/privileged port, or an RFC1918 / link-local / Unix-local host.
-            // Redirects are validated by JSNativeFetchRedirectDelegate before they are followed.
+            // Destination policy for the initial URL; redirects are checked by JSNativeFetchRedirectDelegate.
             guard JSNativeFetch.isDestinationAllowed(url) else {
-                guard let err = JSNativeFetch.jsError("Destination not allowed: \(urlString)", in: context) else { return }
+                guard let currentContext = JSContext.current(),
+                      let err = JSNativeFetch.jsError("Destination not allowed: \(urlString)", in: currentContext) else { return }
                 reject.call(withArguments: [err])
                 return
             }
             let request = JSNativeFetch.makeURLRequest(url: url, options: options)
-            let resolveBox = JSValueBox(resolve)
-            let rejectBox = JSValueBox(reject)
             let taskID = TaskIdentifierBox()
+            // The completion runs on a worker thread: capture only Sendable scalars and weak boxes (issue #47).
+            let weakResolvers = WeakRef(resolvers)
             let task = policySession.session.dataTask(with: request) { data, response, error in
-                // Remove by the task's stable identifier (captured via the box) rather than reading a
-                // mutable `task` reference across threads.
+                // Remove by identifier; reading the mutable `task` here would cross threads.
                 fetchTasks.remove(taskID.value)
-                // The evaluation is complete. Do not do work for it.
-                // A cancelled task also calls this handler, with an error.
+                // Also fires for cancelled tasks, and after the evaluation has ended.
                 guard !fetchTasks.isEnded else { return }
                 let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                 let errorMessage = error.map { "Fetch failed: \($0.localizedDescription)" }
                 CFRunLoopPerformBlock(runLoopBox.runLoop, CFRunLoopMode.defaultMode.rawValue) {
-                    // The evaluation can end after the block goes into the queue.
-                    // A later evaluation on this thread can run the block. Do not call the JavaScript VM.
-                    guard !fetchTasks.isEnded else { return }
+                    // May run in a later evaluation on this thread, after this one ended: never touch the VM then.
+                    guard !fetchTasks.isEnded,
+                          let currentContext = weakContextBox.context,
+                          let pending = weakResolvers.value?.take(taskID.value) else { return }
                     if let errorMessage {
-                        if let err = JSNativeFetch.jsError(errorMessage, in: contextBox.context) {
-                            rejectBox.value.call(withArguments: [err])
+                        if let err = JSNativeFetch.jsError(errorMessage, in: currentContext) {
+                            pending.reject.call(withArguments: [err])
                         }
-                    } else if let resp = JSNativeFetch.fetchResponse(status: status, body: body, context: contextBox.context) {
-                        resolveBox.value.call(withArguments: [resp])
+                    } else if let resp = JSNativeFetch.fetchResponse(status: status, body: body, context: currentContext) {
+                        pending.resolve.call(withArguments: [resp])
                     }
                 }
                 CFRunLoopWakeUp(runLoopBox.runLoop)
             }
-            // Track the task (and its identifier) before resuming, so even an immediately-failing
-            // task is registered for watchdog cancellation.
+            // Track and register before resume so an immediate completion finds its resolver and the watchdog can cancel it.
             taskID.set(task.taskIdentifier)
             fetchTasks.add(task)
+            resolvers.register(task.taskIdentifier, resolve: resolve, reject: reject)
             task.resume()
         }
         openclip.setObject(nativeFetchBlock, forKeyedSubscript: "__nativeFetch" as NSString)
         context.evaluateScript(fetchPolyfillScript)
+        // Lets the host drop pending resolve/reject pairs on the JS thread at run end.
+        return resolvers
     }
 
-    /// Effectively disables URLRequest's 60 s default: a fetch has no app-imposed deadline and is
-    /// left to finish, bounded only by clicking the loading toast (which cancels in-flight tasks).
+    /// Effectively no timeout; fetches are bounded only by cancelling them from the loading toast.
     private static let fetchTimeout: TimeInterval = 60 * 60 * 24 * 365
 
-    /// Builds a URLRequest from `fetch(url, options)`: method (default GET),
-    /// optional headers object, and an optional string body.
+    /// Maps `fetch(url, options)` onto a URLRequest.
     static func makeURLRequest(url: URL, options: JSValue) -> URLRequest {
         var request = URLRequest(url: url)
         request.timeoutInterval = fetchTimeout
@@ -128,17 +125,16 @@ enum JSNativeFetch {
         let textBlock: @convention(block) () -> String = { body }
         response.setObject(textBlock, forKeyedSubscript: "text")
 
-        // The json block escapes into JS, so it captures the context through a
-        // Sendable box rather than the raw non-Sendable JSContext.
-        let contextBox = JSContextBox(context)
+        // Must not capture the context: context -> JSValue -> block -> context keeps the VM alive (issue #47).
         let jsonBlock: @convention(block) () -> Any = {
+            guard let currentContext = JSContext.current() else { return NSNull() }
             if let data = body.data(using: .utf8),
                let object = try? JSONSerialization.jsonObject(with: data) {
                 return object
             }
             Log.js.debug("response.json() received non-JSON body")
-            if let err = JSNativeFetch.jsError("Invalid JSON response", in: contextBox.context) {
-                contextBox.context.exception = err
+            if let err = JSNativeFetch.jsError("Invalid JSON response", in: currentContext) {
+                currentContext.exception = err
             }
             return NSNull()
         }
@@ -146,8 +142,7 @@ enum JSNativeFetch {
         return response
     }
 
-    /// Creates a JS `Error` value (falls back to a plain object if the Error
-    /// constructor is gone).
+    /// Creates a JS `Error`, or a plain object if the constructor is gone.
     static func jsError(_ message: String, in context: JSContext) -> JSValue? {
         if let errorConstructor = context.objectForKeyedSubscript("Error"),
            !errorConstructor.isUndefined, !errorConstructor.isNull {
@@ -156,11 +151,8 @@ enum JSNativeFetch {
         return JSValue(object: ["message": message], in: context)
     }
 
-    /// Destination policy for the fetch bridge. Only http/https are allowed, and the host must not
-    /// be an RFC1918/private, link-local, or Unix-local target (SSRF guard). Loopback is allowed
-    /// on unprivileged ports (>= 1024), excluding sensitive database and daemon ports.
-    /// Applied to the initial URL and, via `JSNativeFetchRedirectDelegate`, to every redirect hop
-    /// before it is followed.
+    /// Destination policy (SSRF guard): http/https only, no private or link-local hosts, and
+    /// loopback only on unprivileged, non-service ports. Also applied to every redirect hop.
     static func isDestinationAllowed(_ url: URL) -> Bool {
         guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return false }
         guard let host = url.host, !host.isEmpty else { return false }
@@ -173,7 +165,6 @@ enum JSNativeFetch {
         return !isLocalOrPrivateHost(host)
     }
 
-    /// Classifies a host string as loopback (localhost, 127.0.0.0/8, ::1).
     static func isLoopbackHost(_ host: String) -> Bool {
         let bare = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let bareNoZone = String(bare.split(separator: "%").first ?? Substring(bare))
@@ -200,9 +191,6 @@ enum JSNativeFetch {
         return false
     }
 
-    /// Validates whether a destination port on loopback is safe:
-    /// - Must be an unprivileged high port (>= 1024)
-    /// - Must not be a sensitive daemon / database port
     static func isAllowedLocalPort(_ port: Int) -> Bool {
         guard port >= 1024 && port <= 65535 else { return false }
         let blockedPorts: Set<Int> = [
@@ -217,10 +205,7 @@ enum JSNativeFetch {
         return !blockedPorts.contains(port)
     }
 
-    /// Classifies a host string as loopback / RFC1918 / link-local / Unix-local. Handles `localhost`
-    /// hostnames and IPv4/IPv6 literals (including IPv4-mapped IPv6 and ULA). Non-literal hostnames
-    /// that resolve to such addresses are not resolved here (that requires DNS); the guard covers
-    /// direct literal/localhost targets.
+    /// Literal and localhost hosts only; hostnames resolving to private addresses are not checked (no DNS here).
     static func isLocalOrPrivateHost(_ host: String) -> Bool {
         let bare = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let bareNoZone = String(bare.split(separator: "%").first ?? Substring(bare))
@@ -261,9 +246,7 @@ enum JSNativeFetch {
         return false
     }
 
-    /// Holds a URLSession rebuilt from the injected session's configuration plus a
-    /// redirect-validating delegate. Captured by the fetch block so both live as long as the
-    /// context that installed the bridge.
+    /// URLSession rebuilt with the redirect-validating delegate; invalidated when the evaluation ends (issue #46).
     private final class PolicySession: @unchecked Sendable {
         let session: URLSession
         let delegate: JSNativeFetchRedirectDelegate
@@ -274,9 +257,7 @@ enum JSNativeFetch {
         }
     }
 
-    /// URLSession task delegate that rejects any redirect whose destination fails the fetch
-    /// destination policy. Returning `nil` from `willPerformHTTPRedirection` aborts the redirect,
-    /// so the task surfaces the original 3xx response instead of following the hop.
+    /// Returning nil from `willPerformHTTPRedirection` aborts a redirect that fails the destination policy.
     private final class JSNativeFetchRedirectDelegate: NSObject, URLSessionTaskDelegate {
         func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
             if let url = request.url, JSNativeFetch.isDestinationAllowed(url) {

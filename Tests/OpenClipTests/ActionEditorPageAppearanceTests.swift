@@ -2,9 +2,8 @@ import XCTest
 @testable import OpenClip
 @testable import Core
 
-/// Regression coverage for the edit-actions sheet's appearance save logic: editing only the title
-/// must never replace an action's real icon (package file / remote image / text glyph) with the
-/// icon picker's placeholder, and legacy overrides written by that old bug heal on the next save.
+/// Regression coverage for the edit-actions sheet's appearance save: a title-only edit must never replace a
+/// real icon with the picker placeholder, and legacy clobbered overrides heal on the next save.
 @MainActor
 final class ActionEditorPageAppearanceTests: XCTestCase {
     private let localIcon = ActionIcon.local(URL(fileURLWithPath: "/tmp/pkg/icon.svg"))
@@ -12,8 +11,7 @@ final class ActionEditorPageAppearanceTests: XCTestCase {
     // MARK: - resolvedSymbolOverride
 
     func testTitleOnlyEditDoesNotClobberNonSymbolIcon() {
-        // Non-symbol-representable icons leave the field empty ("untouched"); saving must not
-        // invent a symbol override.
+        // Non-symbol icons leave the field empty; saving must not invent a symbol override.
         XCTAssertNil(ActionEditorPage.resolvedSymbolOverride(current: "", initial: "", stored: nil))
     }
 
@@ -54,8 +52,7 @@ final class ActionEditorPageAppearanceTests: XCTestCase {
     }
 
     func testInitialDisplayModeStoredSymbolOverrideKeepsIconModeForTextGlyphBuiltins() {
-        // Regression: Copy/Cut/Paste saved in Show Icon mode must reopen in Show Icon, not flip
-        // back to Show Text just because their own icon is a text glyph.
+        // Regression: Copy/Cut/Paste saved in Show Icon mode must reopen in Show Icon, not Show Text.
         let override = ActionOverride(customIconSymbol: "doc.on.doc")
         XCTAssertEqual(ActionEditorPage.initialDisplayMode(override: override, actionIcon: .text("Copy")), 0)
     }
@@ -66,6 +63,47 @@ final class ActionEditorPageAppearanceTests: XCTestCase {
     }
 
     // MARK: - iconModeFallbackSymbol
+
+    func testAIIconModePersistsAcrossReloadWithoutPickingAnIcon() {
+        let action = AIAction(presetID: "rewrite", title: "Rewrite")
+        let store = MemorySettingsStore()
+        let manager = ActionCustomizationManager(settingsStore: store)
+        XCTAssertEqual(manager.popupIcon(for: action), .text("Rewrite"))
+
+        let symbol = ActionEditorPage.resolvedIconModeSymbolOverride(
+            displayMode: 0, current: Constants.defaultAIIconSymbol,
+            initial: Constants.defaultAIIconSymbol, stored: nil, action: action
+        )
+        manager.setOverride(for: action.id, title: nil, symbol: symbol, text: nil)
+
+        let reloaded = ActionCustomizationManager(settingsStore: store)
+        XCTAssertEqual(reloaded.popupIcon(for: action), .symbol(Constants.defaultAIIconSymbol))
+        XCTAssertEqual(
+            ActionEditorPage.initialDisplayMode(override: reloaded.override(for: action.id), actionIcon: action.icon),
+            0
+        )
+    }
+
+    func testAIPickedIconSurvivesTextModeAndPresetRefresh() {
+        let action = AIAction(presetID: "rewrite", title: "Rewrite")
+        let store = MemorySettingsStore()
+        let manager = ActionCustomizationManager(settingsStore: store)
+        manager.setOverride(for: action.id, title: "Polish", symbol: "pencil", text: "Polish")
+
+        let refreshed = AIAction(presetID: action.presetID, title: "Updated preset title")
+        let reloaded = ActionCustomizationManager(settingsStore: store)
+        XCTAssertEqual(reloaded.popupIcon(for: refreshed), .text("Polish"))
+        XCTAssertEqual(reloaded.tableIcon(for: refreshed), .symbol("pencil"))
+        XCTAssertEqual(reloaded.displayTitle(for: refreshed), "Polish")
+
+        let stored = reloaded.override(for: action.id)
+        let symbol = ActionEditorPage.resolvedIconModeSymbolOverride(
+            displayMode: 0, current: "pencil", initial: "pencil",
+            stored: stored?.customIconSymbol, action: refreshed
+        )
+        reloaded.setOverride(for: action.id, title: stored?.customTitle, symbol: symbol, text: nil)
+        XCTAssertEqual(reloaded.popupIcon(for: refreshed), .symbol("pencil"))
+    }
 
     func testIconModeFallbackSymbolForTextGlyphBuiltins() {
         XCTAssertEqual(ActionEditorPage.iconModeFallbackSymbol(for: CopyAction()), "doc.on.doc")
@@ -78,8 +116,8 @@ final class ActionEditorPageAppearanceTests: XCTestCase {
     // MARK: - resolvedIconModeSymbolOverride (Show Icon mode on text-glyph builtins)
 
     func testShowIconModePersistsBuiltinPreferenceSymbolForTextGlyphBuiltins() {
-        // Copy/Cut/Paste carry `.text` icons by default; switching them to Show Icon must persist
-        // their hand-written preference symbol so popupIcon stops resolving the text glyph.
+        // Copy/Cut/Paste have `.text` icons by default; Show Icon must persist their preference symbol
+        // so popupIcon stops resolving the text glyph.
         XCTAssertEqual(
             ActionEditorPage.resolvedIconModeSymbolOverride(displayMode: 0, current: "", initial: "", stored: nil, action: CopyAction()),
             "doc.on.doc"
@@ -121,8 +159,7 @@ final class ActionEditorPageAppearanceTests: XCTestCase {
     }
 
     func testShowIconModeAddsNoOverrideForNonBuiltinTextGlyphActions() {
-        // Extension actions derive preferenceIconName from the icon (the glyph text itself is not a
-        // symbol), so Show Icon mode must not invent an override for them.
+        // Extension text-glyph actions derive their icon from the glyph, so Show Icon must not invent an override.
         XCTAssertNil(
             ActionEditorPage.resolvedIconModeSymbolOverride(displayMode: 0, current: "", initial: "", stored: nil, action: TextGlyphExtensionAction())
         )

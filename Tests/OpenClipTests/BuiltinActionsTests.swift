@@ -22,10 +22,10 @@ final class BuiltinActionsTests: XCTestCase {
         XCTAssertTrue(action.isEnabled(for: context))
         
         let result = try await action.perform(context)
-        if case .copy(let text) = result {
-            XCTAssertEqual(text, "test string")
+        if case .copySelection(let selection) = result {
+            XCTAssertEqual(selection.text, "test string")
         } else {
-            XCTFail("Expected .copy result")
+            XCTFail("Expected native live-selection Copy")
         }
     }
 
@@ -43,13 +43,20 @@ final class BuiltinActionsTests: XCTestCase {
         )
         let context = ActionContext(selection: selection)
         let result = try await action.perform(context)
-        if case .copyContent(let payload) = result {
-            XCTAssertEqual(payload.plainText, "test string")
-            XCTAssertEqual(payload.html, "<b>test string</b>")
-            XCTAssertEqual(payload.rtf, "{\\rtf1 test string}")
+        if case .copySelection(let copiedSelection) = result {
+            XCTAssertEqual(copiedSelection.text, "test string")
+            XCTAssertEqual(copiedSelection.html, "<b>test string</b>")
         } else {
-            XCTFail("Expected .copyContent result when HTML/RTF present")
+            XCTFail("Even captured rich content should use the source application's native Copy")
         }
+    }
+
+    @MainActor
+    func testOCRCopyUsesRecognizedTextWithoutNativeCommand() async throws {
+        let selection = SelectionContext(text: "Recognized text", source: .ocr)
+        let result = try await CopyAction().perform(ActionContext(selection: selection))
+        guard case .copy(let text) = result else { return XCTFail("OCR has no live source selection") }
+        XCTAssertEqual(text, "Recognized text")
     }
     
     @MainActor
@@ -59,10 +66,8 @@ final class BuiltinActionsTests: XCTestCase {
         
         XCTAssertTrue(action.isEnabled(for: context))
         
-        // We just test perform logic here.
         let result = try await action.perform(context)
         if case .simulatePaste = result {
-            // Success
         } else {
             XCTFail("Expected .simulatePaste result")
         }
@@ -84,9 +89,7 @@ final class BuiltinActionsTests: XCTestCase {
         }
     }
 
-    /// The Preferences edit sheet writes the `url` option via SettingsActionOptionStore
-    /// (key `action.builtin.search.option.url`); perform() must honor it, not just the
-    /// legacy pre-option-store key.
+    /// perform() must honor the `url` option the Preferences sheet writes, not just the legacy key.
     @MainActor
     func testSearchActionUsesConfiguredURLOption() async throws {
         let store = MemorySettingsStore()
@@ -101,8 +104,7 @@ final class BuiltinActionsTests: XCTestCase {
         }
     }
 
-    /// Values stored under the legacy `action.search.url` key (written before the option
-    /// store existed) keep working; the option key takes precedence over it.
+    /// Legacy `action.search.url` values still work; the option key takes precedence.
     @MainActor
     func testSearchActionFallsBackToLegacyKeyAndPrefersOption() async throws {
         let legacyOnly = MemorySettingsStore()
@@ -132,7 +134,6 @@ final class BuiltinActionsTests: XCTestCase {
     func testOpenURLAction() async throws {
         let action = OpenURLAction()
         
-        // Test valid URL
         let validContext = createMockContext(with: "https://apple.com")
         XCTAssertTrue(action.isEnabled(for: validContext))
         
@@ -143,7 +144,6 @@ final class BuiltinActionsTests: XCTestCase {
             XCTFail("Expected .openURL result for valid URL")
         }
         
-        // Test URL embedded in surrounding text
         let embeddedContext = createMockContext(with: "Check out https://github.com/apple/swift in this PR!")
         XCTAssertTrue(action.isEnabled(for: embeddedContext))
         let embeddedResult = try await action.perform(embeddedContext)
@@ -153,17 +153,20 @@ final class BuiltinActionsTests: XCTestCase {
             XCTFail("Expected .openURL for embedded URL")
         }
 
-        // Test multiple links in text opens first link
-        let multipleContext = createMockContext(with: "First https://first.com and second https://second.com")
+        // Each distinct link opens once, in first-occurrence order.
+        let multipleContext = createMockContext(with: "First https://first.com and second https://second.com then https://first.com")
         XCTAssertTrue(action.isEnabled(for: multipleContext))
         let multipleResult = try await action.perform(multipleContext)
-        if case .openURL(let url) = multipleResult {
-            XCTAssertEqual(url.absoluteString, "https://first.com")
-        } else {
-            XCTFail("Expected first URL to be extracted")
+        guard case .sequence(let effects) = multipleResult else {
+            return XCTFail("Expected all distinct URLs to be opened")
         }
+        XCTAssertEqual(effects.count, 2)
+        XCTAssertEqual(effects.compactMap { effect -> String? in
+            if case .openURL(let url) = effect { return url.absoluteString }
+            return nil
+        }, ["https://first.com", "https://second.com"])
 
-        // Test bare domain & case insensitivity
+        // Uppercase input is accepted.
         let bareContext = createMockContext(with: "HTTPS://APPLE.COM")
         XCTAssertTrue(action.isEnabled(for: bareContext))
         let bareResult = try await action.perform(bareContext)
@@ -173,7 +176,6 @@ final class BuiltinActionsTests: XCTestCase {
             XCTFail("Expected .openURL for uppercase URL")
         }
 
-        // Test localhost with port
         let localContext = createMockContext(with: "Server at localhost:3000/api")
         XCTAssertTrue(action.isEnabled(for: localContext))
         let localResult = try await action.perform(localContext)
@@ -183,7 +185,7 @@ final class BuiltinActionsTests: XCTestCase {
             XCTFail("Expected .openURL for localhost")
         }
 
-        // Test wrapped web links & punctuation wrapping
+        // Angle-bracketed links are unwrapped.
         let wrappedContext = createMockContext(with: "Open <https://example.com/docs>.")
         XCTAssertTrue(action.isEnabled(for: wrappedContext))
         let wrappedResult = try await action.perform(wrappedContext)
@@ -206,13 +208,11 @@ final class BuiltinActionsTests: XCTestCase {
         let deepLinkContext = createMockContext(with: "Open obsidian://open?vault=Work&file=Note")
         XCTAssertFalse(action.isEnabled(for: deepLinkContext), "custom app deep links must not enable Open Link")
 
-        // Test invalid URL
         let invalidContext = createMockContext(with: "No URL here")
         XCTAssertFalse(action.isEnabled(for: invalidContext))
         
         let invalidResult = try await action.perform(invalidContext)
         if case .failure(_) = invalidResult {
-            // Success
         } else {
             XCTFail("Expected .failure result for invalid URL")
         }
@@ -238,6 +238,22 @@ final class BuiltinActionsTests: XCTestCase {
         }
     }
     
+    @MainActor
+    func testMultipleOpenLinksUseSourceBrowserAndDeduplicate() async throws {
+        let selection = SelectionContext(
+            text: "https://first.com https://second.com https://first.com",
+            sourceApp: AppIdentity(bundleIdentifier: "com.apple.Safari", localizedName: "Safari"),
+            cursorPosition: .zero, timestamp: Date(), appPolicy: .default)
+        let result = try await OpenURLAction().perform(ActionContext(selection: selection))
+        guard case .sequence(let effects) = result else { return XCTFail("Expected multiple links") }
+        XCTAssertEqual(effects.count, 2)
+        for (index, expected) in ["https://first.com", "https://second.com"].enumerated() {
+            guard case .openURLInApp(let url, let bundleID) = effects[index] else { return XCTFail("Expected source browser") }
+            XCTAssertEqual(url.absoluteString, expected)
+            XCTAssertEqual(bundleID, "com.apple.Safari")
+        }
+    }
+
     @MainActor
     func testCutAction() async throws {
         let action = CutAction()

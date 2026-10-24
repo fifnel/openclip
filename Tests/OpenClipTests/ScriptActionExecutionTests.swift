@@ -16,6 +16,42 @@ private extension ActionContext {
 }
 
 final class ScriptActionExecutionTests: XCTestCase {
+    func testScriptOptionsResolveDefaultsSavedValuesAndUpdates() async throws {
+        let script = FileManager.default.temporaryDirectory.appendingPathComponent("options_\(UUID().uuidString).sh")
+        defer { try? FileManager.default.removeItem(at: script) }
+        try """
+        #!/bin/sh
+        printf '%s|%s|%s|%s|%s' "$OPENCLIP_OPTION_API_KEY" "$OPENCLIP_OPTION_ENABLED" "$OPENCLIP_OPTION_FORMAT" "${OPENCLIP_OPTION_EMPTY-unset}" "$OPENCLIP_OPTION_MESSAGE"
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let options = [
+            ExtensionOption(identifier: "api-key", label: "Key", type: .secret),
+            ExtensionOption(identifier: "enabled", label: "Enabled", type: .boolean, defaultValue: "false"),
+            ExtensionOption(identifier: "format", label: "Format", type: .multiple, defaultValue: "plain", options: ["plain", "json"]),
+            ExtensionOption(identifier: "empty", label: "Empty", type: .string),
+            ExtensionOption(identifier: "message", label: "Message", type: .string)
+        ]
+        let store = SettingsActionOptionStore(store: MemorySettingsStore())
+        let id = "test.options"
+        let literal = "quotes \" ' $HOME $(exit 1); `exit 1`\nnext line"
+        store.setStringValue("secret-value", actionID: id, option: options[0])
+        store.setStringValue(literal, actionID: id, option: options[4])
+        store.setStringValue("other-action", actionID: "test.other", option: options[2])
+        let action = ScriptAction(id: id, title: "Options", icon: .symbol("terminal"), scriptURL: script,
+                                  options: options, optionStore: store)
+        let context = ActionContext(selectedText: "input")
+        guard case .text(let first) = try await action.perform(context) else {
+            return XCTFail("Expected text")
+        }
+        XCTAssertEqual(first, "secret-value|false|plain||" + literal)
+        store.setStringValue("true", actionID: id, option: options[1])
+        store.setStringValue("json", actionID: id, option: options[2])
+        guard case .text(let second) = try await action.perform(context) else {
+            return XCTFail("Expected text")
+        }
+        XCTAssertEqual(second, "secret-value|true|json||" + literal)
+    }
+
     func testScriptActionPlainStdoutReturnsTextResult() async throws {
         let tempScript = FileManager.default.temporaryDirectory.appendingPathComponent("echo_test_\(UUID().uuidString).sh")
         let scriptContent = """
@@ -150,9 +186,7 @@ final class ScriptActionExecutionTests: XCTestCase {
         try? FileManager.default.removeItem(at: tempScript)
     }
 
-    /// A legacy manifest `type: "canvas"` whose `script` points at a `.sh` file degrades to a shell
-    /// ScriptAction — with the canvas feature removed, the script file is routed by extension, so
-    /// a `.sh` payload is a plain shell action (and validation rejects the canvas kind anyway).
+    /// A legacy `type: "canvas"` manifest pointing at a `.sh` file degrades to a plain shell action.
     func testCanvasManifestWithShellFileIsPlainShellAction() async {
         let factory = DefaultActionFactory()
         let actionMeta = ExtensionActionMetadata(title: "Canvas File Action", icon: "symbol:terminal", script: "main.sh", type: "canvas")
@@ -198,9 +232,7 @@ final class ScriptActionExecutionTests: XCTestCase {
         try? FileManager.default.removeItem(at: tempScript)
     }
 
-    /// A subprocess that never exits must be killed by the GCD watchdog at the invocation budget
-    /// instead of hanging the suite. Regression for the mid-suite hang where a blocked
-    /// `readToEnd()` plus a starved `Task.sleep` watchdog wedged the cooperative pool.
+    /// Regression: a never-exiting subprocess must be killed by the GCD watchdog, not hang the suite.
     func testScriptActionWatchdogKillsNeverExitingScript() async throws {
         let tempScript = FileManager.default.temporaryDirectory.appendingPathComponent("hang_test_\(UUID().uuidString).sh")
         let scriptContent = """
@@ -229,8 +261,7 @@ final class ScriptActionExecutionTests: XCTestCase {
         try? FileManager.default.removeItem(at: tempScript)
     }
 
-    /// A grandchild that leaves the process group must still die when the watchdog fires.
-    /// `set -m` puts the background sleep in a new group (same hole as setsid/setpgid).
+    /// A grandchild that leaves the process group (`set -m`) must still die when the watchdog fires.
     func testScriptActionWatchdogKillsDetachedGrandchild() async throws {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("openclip-watchdog-\(UUID().uuidString)")
@@ -272,8 +303,7 @@ final class ScriptActionExecutionTests: XCTestCase {
         XCTAssertNotEqual(kill(grandchildPid, 0), 0, "detached grandchild must be gone after watchdog")
     }
 
-    /// Cancelling the Swift Task executing a subprocess must immediately signal and kill the
-    /// subprocess group and throw CancellationError without waiting for the full timeout.
+    /// Cancelling the task must kill the subprocess group at once, without waiting for the timeout.
     func testScriptActionCancellationKillsSubprocessImmediately() async throws {
         let tempScript = FileManager.default.temporaryDirectory.appendingPathComponent("cancel_test_\(UUID().uuidString).sh")
         let scriptContent = """
@@ -294,7 +324,6 @@ final class ScriptActionExecutionTests: XCTestCase {
             ))
         }
 
-        // Wait slightly for process to spawn
         try await Task.sleep(nanoseconds: 50_000_000)
         task.cancel()
 
@@ -302,7 +331,6 @@ final class ScriptActionExecutionTests: XCTestCase {
             _ = try await task.value
             XCTFail("Expected task to be cancelled and throw CancellationError")
         } catch is CancellationError {
-            // Expected
         } catch {
             XCTFail("Expected CancellationError, got \(error)")
         }
@@ -313,8 +341,7 @@ final class ScriptActionExecutionTests: XCTestCase {
         try? FileManager.default.removeItem(at: tempScript)
     }
 
-    /// Large stdout output spanning multiple pipe buffer chunks must be completely and
-    /// cleanly accumulated without truncation.
+    /// Stdout spanning several pipe buffer chunks must be captured without truncation.
     func testScriptActionLargeOutputIsCapturedCompletely() async throws {
         let tempScript = FileManager.default.temporaryDirectory.appendingPathComponent("large_output_\(UUID().uuidString).sh")
         let scriptContent = """
@@ -342,10 +369,7 @@ final class ScriptActionExecutionTests: XCTestCase {
         try? FileManager.default.removeItem(at: tempScript)
     }
 
-    /// Output that reaches the pipe after the direct child exits must still be captured.
-    /// `waitUntilExit()` returns as soon as the parent exits, so the pipe drain — not the async
-    /// readability handler — is the only thing that can collect this line. Reading the accumulated
-    /// buffer before that drain loses output, which is what this pins.
+    /// Output written after the direct child exits must still be captured by the pipe drain.
     func testScriptActionOutputWrittenAfterParentExitIsCaptured() async throws {
         let tempScript = FileManager.default.temporaryDirectory.appendingPathComponent("late_write_\(UUID().uuidString).sh")
         let scriptContent = """
@@ -371,8 +395,7 @@ final class ScriptActionExecutionTests: XCTestCase {
         try? FileManager.default.removeItem(at: tempScript)
     }
 
-    /// When a script spawns a background grandchild process that inherits the pipe fds,
-    /// finish must not hang indefinitely waiting for EOF on the pipe.
+    /// A background grandchild holding the pipe fds must not make the run hang waiting for EOF.
     func testScriptActionGrandchildHoldingPipeDoesNotHang() async throws {
         let tempScript = FileManager.default.temporaryDirectory.appendingPathComponent("grandchild_pipe_\(UUID().uuidString).sh")
         let scriptContent = """
@@ -414,8 +437,7 @@ final class ScriptActionExecutionTests: XCTestCase {
         }
     }
 
-    /// A multiline selection must be escaped to AppleScript's `\r`/`\n` string escapes so the
-    /// generated script is a valid string literal and the value round-trips.
+    /// Multiline selections must be escaped to AppleScript `\r`/`\n` so the value round-trips.
     @MainActor
     func testAppleScriptActionEscapesMultilineSelection() async throws {
         let scriptCode = """
@@ -433,9 +455,7 @@ final class ScriptActionExecutionTests: XCTestCase {
         }
     }
 
-    /// A script authored with an explicit `on run` handler must work: the runtime injects the
-    /// selection as a top-level `property` (which coexists with `on run`), not top-level `set`
-    /// statements (which AppleScript rejects with -2752). Regression for the Apple Music extension.
+    /// An explicit `on run` handler must work: the selection is injected as a `property`, since top-level `set` fails with -2752. Regression for the Apple Music extension.
     @MainActor
     func testAppleScriptActionSupportsOnRunHandlerStyle() async throws {
         let scriptCode = """

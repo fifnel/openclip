@@ -1,30 +1,32 @@
-# Extension Package Format (`.openclipext`)
+# Extension package format (`.openclipext`)
 
-> **Authoritative reference:** the current manifest schema, all action kinds, options,
+> Authoritative reference: the current manifest schema, all action kinds, options,
 > requirements, groups, and the runtime result surface are documented in
 > [`Extensions/AGENTS.md`](../../Extensions/AGENTS.md). This page is a summary and may lag it.
 
 OpenClip extension packages are directory bundles (suffixed with `.openclipext` or plain directories) containing a manifest JSON file (`manifest.json`, `openclip.json`, or `Config.json`) along with supporting script files and local asset icons.
 
----
-
-## Package Directory Structure
+## Package directory structure
 
 ```text
 my-extension.openclipext/
-├── manifest.json # Required: Extension manifest definition
+├── manifest.json
 ├── main.js # Action script file (JavaScript, AppleScript, or Executable)
-├── icon.png # Optional: Local action icon image
-└── README.md # Optional: Documentation
+├── icon.png
+└── README.md
 ```
 
----
+## Installation
 
-## Manifest JSON Schema (`ExtensionMetadata`)
+- **Finder Double-Click**: `.openclipext` bundles are registered macOS document packages owned by OpenClip (`com.openclip.extension`). Double-clicking a `.openclipext` package (or `.openclipext.zip` archive) opens a confirmation dialog in OpenClip with package metadata, installs the package directly into `~/.openclip/extensions`, and marks it trusted.
+- **Extension Store**: Deep links (`openclip://install?id=...&url=...`) download and install verified releases.
+- **Manual / CLI**: Drop folders into `~/.openclip/extensions` or run `./Extensions/scripts/install.sh <path>`.
 
-OpenClip decodes extension metadata via [`ExtensionMetadata`](../../Sources/Core/Extensions/ExtensionManager.swift). To ensure backward compatibility, the decoder supports both modern camelCase keys and legacy capitalized/singular keys.
+## Manifest JSON schema (`ExtensionMetadata`)
 
-### Complete Example `manifest.json`
+OpenClip decodes extension metadata via [`ExtensionMetadata`](../../Sources/Core/Extensions/ExtensionManager.swift). For backward compatibility, the decoder accepts both modern camelCase keys and legacy capitalized or singular keys.
+
+### Complete example `manifest.json`
 
 ```json
 {
@@ -56,11 +58,9 @@ OpenClip decodes extension metadata via [`ExtensionMetadata`](../../Sources/Core
 }
 ```
 
----
+## Manifest fields reference
 
-## Manifest Fields Reference
-
-### Top-Level Metadata (`ExtensionMetadata`)
+### Top-level metadata (`ExtensionMetadata`)
 
 | Field | Type | Legacy Alias | Description |
 | :--- | :--- | :--- | :--- |
@@ -69,18 +69,18 @@ OpenClip decodes extension metadata via [`ExtensionMetadata`](../../Sources/Core
 | `description` | String / Object | `Description` | Optional package summary. Plain string or localized dictionary. |
 | `actions` | Array / Object | `action`, `Actions` | List of action definitions (or single action object). |
 | `options` | Array | `Options` | Optional array of user-configurable settings. |
-| `keywords` | Array / String | — | Optional search keywords for the package actions in the action-search palette. |
-| `version` | String | — | Declared package version; recorded in the validation log line, not used for loading. |
-| `capabilities` | Array | — | Declared runtime capabilities. The known set is **empty** on day one, so any non-empty value rejects the manifest. Reserved. |
-| `output` | String | — | Optional default output contract kind (`"text"`, `"file"`, `"none"`, `"dynamic"`) inherited by actions in the package. |
-| `result` | String | — | Optional default delivery recommendation (`"preview"`, `"paste"`, `"copy"`, `"paste-or-copy"`, `"open"`, `"save"`) inherited by actions. |
+| `keywords` | Array / String | - | Optional search keywords for the package actions in the action-search palette. |
+| `version` | String | - | Declared package version; recorded in the validation log line, not used for loading. |
+| `capabilities` | Array | - | Declared runtime capabilities. The known set is empty on day one, so any non-empty value rejects the manifest. Reserved. |
+| `output` | String | - | Optional default output contract kind (`"text"`, `"file"`, `"none"`, `"dynamic"`) inherited by actions in the package. |
+| `result` | String | - | Optional default delivery recommendation (`"preview"`, `"paste"`, `"copy"`, `"paste-or-copy"`, `"open"`, `"save"`) inherited by actions. |
 
-Manifests are **validated** on load (`ManifestValidator`): unknown action kinds, missing required
+Manifests are validated on load (`ManifestValidator`): unknown action kinds, missing required
 fields (`keyPress`/`shortcutName`/`subActions`/executable payload), and any declared capability
 reject the package, which is then logged (category `extensions`) rather than silently skipped. See
 [`docs/architecture/extensions.md`](../architecture/extensions.md).
 
-### Action Object (`ExtensionActionMetadata`)
+### Action object (`ExtensionActionMetadata`)
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
@@ -102,23 +102,34 @@ reject the package, which is then logged (category `extensions`) rather than sil
 | `subActions` | Array | Sub-action objects for `type: "group"`; rendered as a sub-menu with IDs `<groupID>.<subID>`. |
 | `output` | String | Optional declared output kind: `"text"`, `"file"`, `"none"`, `"dynamic"`. Inherits package-level `output` if omitted, or falls back to inference sniffing for legacy extensions. |
 | `result` | String | Optional recommended delivery: `"preview"` (result card), `"paste"`, `"copy"`, `"paste-or-copy"`, `"open"`, `"save"`. Defaults to package-level default or kind defaults (`paste-or-copy` for text, `preview` for file). |
-| `secondary` | Object | Optional. Secondary-click (right-click/⇧-click) outcome: `{ "type": "copy" | "paste" | "openURL" | "toast" | "success" | "none", "value"?, "message"? }`. **Non-JS kinds only** — rejected on `javascript` (JS authors branch on `openclip.input.isSecondaryClick` in-script instead). |
+| `secondary` | Object | Optional. Secondary-click (right-click/⇧-click) outcome: `{ "type": "copy" | "paste" | "openURL" | "toast" | "success" | "none", "value"?, "message"? }`. **Non-JS kinds only**, rejected on `javascript` (JS authors branch on `openclip.input.isSecondaryClick` in-script instead). |
 | `toast` | Object | Optional. Primary-click companion toast `{ "message": string | object, "style"?: "success" | "error" | "info" }` (default style `success`). Valid on all kinds. Message can be localized dictionary. |
 | `secondaryToast` | Object | Optional. Secondary-click companion toast (same shape as `toast`). Valid on all kinds. Dash alias: `secondary-toast`. |
+| `requirements.content` | Array | Non-empty list of `url`, `email`, `date`, `path`, `phone`, `address`; any detected type passes, makes the action contextual, and supplies `openclip.input.detected`. Requires 1.9.0. |
+| `requirements.input` | String | Input contract: `optional`, `text` (default), `liveSelection`, or `editableSelection`. Legacy `requiresSelection`/`requires-selection` maps `true` to `text` and `false` to `optional`; do not combine legacy and new keys. |
+| `requirements.requiresPasteTarget` | Boolean | Optional destination gate. `true` requires a confirmed Paste-capable target; `false` or omission means no paste target is required, not that paste is forbidden. Dash alias: `requires-paste-target`. |
+
+`text` accepts nonblank selection, clipboard, or OCR text. `liveSelection` requires text from the
+current live selection. `editableSelection` additionally requires confirmed editability of that
+selection; unknown editability fails closed. Paste destination support is independent from input
+source, so clipboard-derived transformations can still be pasted into a confirmed destination.
+Older OpenClip releases ignore unknown manifest keys; do not publish catalog packages that rely on
+these gates until an enforcing release exists. The current source version 1.7.3 is not a confirmed
+compatibility floor, so `minOpenClipVersion` must wait for that release's version to be established.
 
 The `secondary`/`toast`/`secondaryToast` keys map onto the per-action `Action.delivery` (see
 [`Extensions/AGENTS.md` §5b](../../Extensions/AGENTS.md)); the delivery decision (Select → Probe →
 Toast) then applies the probe and resolves the companion toast.
 
-### Extension Output Contract & Delivery Resolution
+### Extension output contract and delivery resolution
 
-OpenClip uses an **Author Output Contract** system (`output` and `result`) for extensions:
+OpenClip uses an author output contract (`output` and `result`) for extensions:
 - **`output` (`text` | `file` | `none` | `dynamic`)**: Declares what type of output the action produces. Non-output actions (`url`, `keyPress`, `shortcut`, `service`) default to `none`.
 - **`result` (`preview` | `paste` | `copy` | `paste-or-copy` | `open` | `save`)**: Declares the author's recommended default outcome. Text actions default to `paste-or-copy`; file actions default to `preview`.
 - **User Customization**: Users can override the delivery mode per-action in Settings (`Show in card`, `Paste`, `Copy`).
-- **Clipboard Invariant**: Secondary click (right-click or ⇧-click) always copies the result to the clipboard (or displays a preview card if the primary click was copy), unless the action explicitly declares a custom `secondary` outcome.
+- **Clipboard Invariant**: Secondary click (right-click or ⇧-click) always copies the result to the clipboard (or displays a preview card if the primary click was copy), unless the action explicitly declares a custom `secondary` outcome. If the user set the action to **Show in card**, a secondary click on a text result shows the card too.
 
-### Native File Output Results
+### Native file output results
 
 Actions implemented in JavaScript (`openclip.file`, `openclip.copyFile`, `openclip.saveFile`) or executable scripts (JSON `{"type": "file" | "copyFile" | "saveFile", ...}` or auto-detected regular file paths on stdout) can produce native file results. When returning a file, OpenClip renders an interactive file preview card in the popup panel (supporting inline image/SVG previews, system file icons, metadata inspection, drag-and-drop into other apps, and Open/Copy/Save shortcuts) or triggers direct clipboard copy / disk saving.
 
@@ -127,9 +138,7 @@ Actions implemented in JavaScript (`openclip.file`, `openclip.copyFile`, `opencl
 The former interactive-canvas kind `"canvas"` was removed; a `type: "canvas"` manifest is rejected
 at load (`unknownActionKind("canvas")`).
 
----
-
-## Options Schema (`ExtensionOptionMetadata`)
+## Options schema (`ExtensionOptionMetadata`)
 
 Extensions can expose user preferences rendered in the Preferences window under **Dynamic Action Configuration**.
 
@@ -141,7 +150,9 @@ Extensions can expose user preferences rendered in the Preferences window under 
 | `default` | String | `Default` | Default value if unspecified by the user. |
 | `options` | Array | `Options` | Candidate choices for `type: "multiple"`. |
 
-### Option Storage & Retrieval
+### Option storage and retrieval
 - Non-secret option values are saved through [`SettingsStore`](../../Sources/Core/Settings/SettingsStore.swift) using typed setting key strings: `SettingKey<String>("action.<id>.option.<identifier>", defaultValue:)`.
-- `type: "secret"` option values live in `SecretStore` (`~/.openclip/secrets.json` with POSIX 0600 permissions), never `SettingsStore`/UserDefaults — resolved via [`SecretActionOptionStore`](../../Sources/OpenClip/Platform/Extensions/SecretActionOptionStore.swift).
+- `type: "secret"` option values live in `SecretStore` (`~/.openclip/secrets.json` with POSIX 0600 permissions), never `SettingsStore`/UserDefaults, resolved via [`SecretActionOptionStore`](../../Sources/OpenClip/Platform/Extensions/SecretActionOptionStore.swift).
 - Direct `UserDefaults.standard` access is discouraged and should not be added in new code. The JavaScript runtime reads options through the injected `ActionOptionReading` store (`OpenClipJSHost`), not `UserDefaults`.
+
+Native result shapes and migration from retired `requirements.expression` are documented in [native content requirements](native-content-requirements.md).

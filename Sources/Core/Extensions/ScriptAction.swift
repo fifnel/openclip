@@ -1,13 +1,8 @@
 // ScriptAction.swift
 // OpenClip
 //
-// Implements an action backed by an external script file located in an extension directory.
-// Enablement and match resolution delegate to the shared ActionVisibility evaluator when rules
-// are attached; perform exports the selection and match data to the subprocess via env vars
-// (OPENCLIP_TEXT, OPENCLIP_MATCHED, OPENCLIP_CAPTURE_N, OPENCLIP_BUNDLE_ID, OPENCLIP_ACTION_ID)
-// and runs it through the
-// shared ShellProcessRunner (one watchdog), then translates stdout JSON via ShellResultMapper and
-// returns the raw runtime result (secondary/delivery handling happens downstream).
+// An action backed by a script file in an extension directory. Selection and match data go to the
+// subprocess as OPENCLIP_* env vars and run through the shared ShellProcessRunner.
 import Foundation
 
 public struct ScriptAction: ConfigurableAction, ActionWithRules {
@@ -15,15 +10,28 @@ public struct ScriptAction: ConfigurableAction, ActionWithRules {
     public let title: String
     public let icon: ActionIcon
     public let scriptURL: URL
+    public let actionOptions: [ExtensionOption]
+    private let optionStore: any ActionOptionReading
     public let rules: ExtensionActionRules?
     
     public let chrome: ActionChrome
     
-    public init(id: String, title: String, icon: ActionIcon, scriptURL: URL, chrome: ActionChrome? = nil, rules: ExtensionActionRules? = nil) {
+    public init(
+        id: String,
+        title: String,
+        icon: ActionIcon,
+        scriptURL: URL,
+        options: [ExtensionOption] = [],
+        optionStore: any ActionOptionReading = SettingsActionOptionStore(),
+        chrome: ActionChrome? = nil,
+        rules: ExtensionActionRules? = nil
+    ) {
         self.id = id
         self.title = title
         self.icon = icon
         self.scriptURL = scriptURL
+        self.actionOptions = options
+        self.optionStore = optionStore
         self.rules = rules
         self.chrome = chrome ?? ActionChrome(badge: .script, rowStyle: .standard, popupBehavior: .perform, source: .extensionPkg(packageID: id))
     }
@@ -32,7 +40,7 @@ public struct ScriptAction: ConfigurableAction, ActionWithRules {
     @MainActor
     public func isEnabled(for context: ActionContext) -> Bool {
         guard let rules else {
-            // Scripts usually need some text, but could be general. We'll enable if there is any selection.
+            // Enabled when there is any selection text.
             return !context.selection.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
         return rules.resolveVisibility(for: context).enabled
@@ -44,7 +52,6 @@ public struct ScriptAction: ConfigurableAction, ActionWithRules {
         return rules.resolveVisibility(for: context).match
     }
     
-    /// Runs the extension script and converts its standard output into an action result.
     @MainActor
     public func perform(_ context: ActionContext) async throws -> ActionResult {
         let text = context.selection.text
@@ -79,6 +86,11 @@ public struct ScriptAction: ConfigurableAction, ActionWithRules {
         env[Constants.envVarLocale] = Locale.current.identifier
         env[Constants.envVarLanguage] = Locale.current.language.languageCode?.identifier ?? "en"
 
+        for option in actionOptions {
+            let key = "OPENCLIP_OPTION_" + option.identifier.uppercased().replacingOccurrences(of: "-", with: "_")
+            env[key] = optionStore.stringValue(actionID: id, option: option)
+        }
+
         let output = try await ShellProcessRunner.run(ShellProcessRunner.Invocation(
             executableURL: scriptURL,
             arguments: [],
@@ -86,9 +98,7 @@ public struct ScriptAction: ConfigurableAction, ActionWithRules {
             stdinText: text
         ))
 
-        // Raw runtime result: JSON stdout wins, plain-text stdout file detection wins if existing file,
-        // plain-text stdout is implicitly returned text (governed by the user's per-click preference),
-        // empty stdout succeeds.
+        // Precedence: JSON stdout, then an existing file path, then plain-text stdout as returned text.
         let raw: ActionResult
         if let jsonResult = ShellResultMapper.actionResult(from: output.stdout, actionID: id) {
             raw = jsonResult

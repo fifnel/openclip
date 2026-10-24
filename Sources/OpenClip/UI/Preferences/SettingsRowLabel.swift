@@ -10,9 +10,7 @@
 
 import SwiftUI
 
-/// Section card container for settings cards:
-/// section heading sits OUTSIDE the card, semibold, secondary color, ~16-17pt.
-/// The card itself is a rounded rectangle (~18pt radius) with a slightly lighter fill.
+/// Section card with its heading outside a rounded, lightly filled container.
 struct SettingsCard<Content: View>: View {
     var title: LocalizedStringKey?
     var infoTooltip: String?
@@ -80,17 +78,19 @@ struct SettingsRowLabel: View {
     var subtitleText: Text?
     var systemImage: String?
     var iconTileTint: Color?
-    /// Renders the glyph as a plain, secondary-colored symbol instead of a colored tile. A neutral
-    /// anchor for control rows, where a saturated tile would just be decoration.
+    /// Plain secondary-colored glyph instead of a colored tile, for control rows where a tile is decoration.
     var plainIcon: Bool
+    var descriptionOnHover: Bool
+    @State private var isHovered = false
+    @State private var isDescriptionPresented = false
 
-    /// Creates a settings label with an optional localized subtitle.
     init(
         title: LocalizedStringKey,
         subtitle: LocalizedStringKey? = nil,
         systemImage: String? = nil,
         iconTileTint: Color? = nil,
-        plainIcon: Bool = false
+        plainIcon: Bool = false,
+        descriptionOnHover: Bool = false
     ) {
         self.title = title
         self.subtitle = subtitle
@@ -98,15 +98,16 @@ struct SettingsRowLabel: View {
         self.systemImage = systemImage
         self.iconTileTint = iconTileTint
         self.plainIcon = plainIcon
+        self.descriptionOnHover = descriptionOnHover
     }
 
-    /// Creates a settings label with an optional prebuilt subtitle view.
     init(
         title: LocalizedStringKey,
         subtitleText: Text?,
         systemImage: String? = nil,
         iconTileTint: Color? = nil,
-        plainIcon: Bool = false
+        plainIcon: Bool = false,
+        descriptionOnHover: Bool = false
     ) {
         self.title = title
         self.subtitle = nil
@@ -114,6 +115,7 @@ struct SettingsRowLabel: View {
         self.systemImage = systemImage
         self.iconTileTint = iconTileTint
         self.plainIcon = plainIcon
+        self.descriptionOnHover = descriptionOnHover
     }
 
     var body: some View {
@@ -122,7 +124,7 @@ struct SettingsRowLabel: View {
                 if plainIcon {
                     Image(systemName: systemImage)
                         .font(.system(size: 13, weight: .regular))
-                        .foregroundStyle(SettingsDesignTokens.secondaryText)
+                        .foregroundStyle(iconTileTint ?? SettingsDesignTokens.secondaryText)
                         .frame(width: 20, alignment: .center)
                 } else {
                     let tint = iconTileTint ?? SettingsDesignTokens.iconTileColor(forSystemImage: systemImage)
@@ -130,22 +132,59 @@ struct SettingsRowLabel: View {
                 }
             }
             VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.system(size: 13, weight: .regular))
-                    .foregroundStyle(SettingsDesignTokens.rowTitleColor)
-                if let subtitleText {
-                    subtitleText
-                        .font(.caption)
-                        .foregroundStyle(SettingsDesignTokens.rowSubtitleColor)
-                        .fixedSize(horizontal: false, vertical: true)
-                } else if let subtitle {
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(SettingsDesignTokens.rowSubtitleColor)
-                        .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 5) {
+                    Text(title)
+                        .font(.system(size: 13, weight: .regular))
+                        .foregroundStyle(SettingsDesignTokens.rowTitleColor)
+
+                    if descriptionOnHover && (subtitle != nil || subtitleText != nil) {
+                        Button {
+                            isDescriptionPresented = true
+                        } label: {
+                            Image(systemName: "info.circle")
+                                .font(.system(size: 11, weight: .regular))
+                                .foregroundStyle(SettingsDesignTokens.secondaryText)
+                                .frame(width: 16, height: 16)
+                                .contentShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .opacity(isHovered || isDescriptionPresented ? 1 : 0)
+                        .help(String(localized: "Show setting description"))
+                        .accessibilityLabel(String(localized: "Show setting description"))
+                        .popover(isPresented: $isDescriptionPresented, arrowEdge: .leading) {
+                            Group {
+                                if let subtitleText {
+                                    subtitleText
+                                } else if let subtitle {
+                                    Text(subtitle)
+                                }
+                            }
+                            .font(.system(size: 12))
+                            .foregroundStyle(SettingsDesignTokens.primaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: 280, alignment: .leading)
+                            .padding(12)
+                        }
+                    }
+                }
+
+                if !descriptionOnHover {
+                    if let subtitleText {
+                        subtitleText
+                            .font(.caption)
+                            .foregroundStyle(SettingsDesignTokens.rowSubtitleColor)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else if let subtitle {
+                        Text(subtitle)
+                            .font(.caption)
+                            .foregroundStyle(SettingsDesignTokens.rowSubtitleColor)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
         }
+        .onHover { isHovered = $0 }
+        .animation(.easeInOut(duration: 0.12), value: isHovered || isDescriptionPresented)
     }
 }
 
@@ -153,40 +192,46 @@ struct SettingsRowLabel: View {
 struct SettingsRow<Trailing: View>: View {
     let title: LocalizedStringKey
     var subtitle: LocalizedStringKey?
+    /// Explanation shown in the (i) popover next to the title instead of a line under it.
+    var info: LocalizedStringKey?
     var subtitleText: Text?
     var systemImage: String?
     var iconTileTint: Color?
     var plainIcon: Bool
+    var descriptionOnHover: Bool
     var showChevron: Bool
     @ViewBuilder var trailing: () -> Trailing
 
-    /// Creates a settings row with a localized subtitle and trailing control.
     init(
         title: LocalizedStringKey,
         subtitle: LocalizedStringKey? = nil,
+        info: LocalizedStringKey? = nil,
         systemImage: String? = nil,
         iconTileTint: Color? = nil,
         plainIcon: Bool = false,
+        descriptionOnHover: Bool = false,
         showChevron: Bool = false,
         @ViewBuilder trailing: @escaping () -> Trailing
     ) {
         self.title = title
         self.subtitle = subtitle
+        self.info = info
         self.subtitleText = nil
         self.systemImage = systemImage
         self.iconTileTint = iconTileTint
         self.plainIcon = plainIcon
+        self.descriptionOnHover = descriptionOnHover
         self.showChevron = showChevron
         self.trailing = trailing
     }
 
-    /// Creates a settings row with a prebuilt subtitle and trailing control.
     init(
         title: LocalizedStringKey,
         subtitleText: Text?,
         systemImage: String? = nil,
         iconTileTint: Color? = nil,
         plainIcon: Bool = false,
+        descriptionOnHover: Bool = false,
         showChevron: Bool = false,
         @ViewBuilder trailing: @escaping () -> Trailing
     ) {
@@ -196,28 +241,36 @@ struct SettingsRow<Trailing: View>: View {
         self.systemImage = systemImage
         self.iconTileTint = iconTileTint
         self.plainIcon = plainIcon
+        self.descriptionOnHover = descriptionOnHover
         self.showChevron = showChevron
         self.trailing = trailing
     }
 
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
-            if let subtitleText {
-                SettingsRowLabel(
-                    title: title,
-                    subtitleText: subtitleText,
-                    systemImage: systemImage,
-                    iconTileTint: iconTileTint,
-                    plainIcon: plainIcon
-                )
-            } else {
-                SettingsRowLabel(
-                    title: title,
-                    subtitle: subtitle,
-                    systemImage: systemImage,
-                    iconTileTint: iconTileTint,
-                    plainIcon: plainIcon
-                )
+            HStack(alignment: .center, spacing: 8) {
+                if let subtitleText {
+                    SettingsRowLabel(
+                        title: title,
+                        subtitleText: subtitleText,
+                        systemImage: systemImage,
+                        iconTileTint: iconTileTint,
+                        plainIcon: plainIcon,
+                        descriptionOnHover: descriptionOnHover
+                    )
+                } else {
+                    SettingsRowLabel(
+                        title: title,
+                        subtitle: subtitle,
+                        systemImage: systemImage,
+                        iconTileTint: iconTileTint,
+                        plainIcon: plainIcon,
+                        descriptionOnHover: descriptionOnHover
+                    )
+                }
+                if let info {
+                    SettingsInfoButton(title: title, info: info)
+                }
             }
             Spacer(minLength: 12)
             trailing()
@@ -237,6 +290,7 @@ struct SettingsRow<Trailing: View>: View {
 struct SettingsToggleRow: View {
     let title: LocalizedStringKey
     var subtitle: LocalizedStringKey?
+    var info: LocalizedStringKey?
     var systemImage: String?
     var iconTileTint: Color?
     var plainIcon: Bool
@@ -245,6 +299,7 @@ struct SettingsToggleRow: View {
     init(
         title: LocalizedStringKey,
         subtitle: LocalizedStringKey? = nil,
+        info: LocalizedStringKey? = nil,
         systemImage: String? = nil,
         iconTileTint: Color? = nil,
         plainIcon: Bool = false,
@@ -252,6 +307,7 @@ struct SettingsToggleRow: View {
     ) {
         self.title = title
         self.subtitle = subtitle
+        self.info = info
         self.systemImage = systemImage
         self.iconTileTint = iconTileTint
         self.plainIcon = plainIcon
@@ -262,6 +318,7 @@ struct SettingsToggleRow: View {
         SettingsRow(
             title: title,
             subtitle: subtitle,
+            info: info,
             systemImage: systemImage,
             iconTileTint: iconTileTint,
             plainIcon: plainIcon

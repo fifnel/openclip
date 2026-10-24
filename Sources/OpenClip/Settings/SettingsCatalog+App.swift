@@ -11,9 +11,17 @@ extension SettingsCatalog {
     static var appKeys: [AnySettingKey] {
         [
             SettingKey.showMenuBarIcon.erased,
+            SettingKey.preferencesActionsSectionExpanded.erased,
+            SettingKey.preferencesInstalledSectionExpanded.erased,
+            SettingKey.preferencesSystemPromptExpanded.erased,
             SettingKey.resultCardWidth.erased,
-            SettingKey.resultCardHeight.erased,
+            SettingKey.resultCardHeight.erased
+        ] + aiKeys
+    }
 
+    /// Provider, model and action settings: the connection choices carried between the Dev and release builds.
+    static var aiKeys: [AnySettingKey] {
+        [
             SettingKey.aiActiveProvider.erased,
             SettingKey.aiCloudService.erased,
             SettingKey.aiCloudCustomURL.erased,
@@ -28,7 +36,8 @@ extension SettingsCatalog {
             SettingKey.aiCLIModel.erased,
             SettingKey.aiCLICustomModel.erased,
             SettingKey.aiCLICustomAuthCommand.erased,
-            SettingKey.aiActionPresetsJSON.erased
+            SettingKey.aiActionPresetsJSON.erased,
+            SettingKey.aiCustomSystemPrompt.erased
         ]
     }
 

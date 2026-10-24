@@ -7,8 +7,7 @@ import Foundation
 public struct SettingKey<Value: Sendable>: Sendable {
     public let name: String
     public let defaultValue: Value
-    /// Bumped when the meaning or shape of this setting's stored value changes, so a future
-    /// migration can tell old data from new. Brand-new keys start at 1.
+    /// Bumped when the stored value's shape changes, so a migration can tell old data from new.
     public let schemaVersion: Int
 
     public init(_ name: String, defaultValue: Value, schemaVersion: Int = 1) {
@@ -18,10 +17,7 @@ public struct SettingKey<Value: Sendable>: Sendable {
     }
 }
 
-/// Stable per-action option namespaces (Phase 7). `defaultsKey` is the SettingsStore/UserDefaults
-/// key for non-secret options; `keychainAccount` names the Keychain account for `.secret` options.
-/// Both produce the same `action.<actionID>.option.<optionID>` string — one namespace, two backends
-/// (secrets never touch UserDefaults).
+/// Per-action option namespace: `defaultsKey` and `keychainAccount` yield the same string; secrets never touch UserDefaults.
 public enum ActionOptionKey {
     public static func defaultsKey(actionID: String, optionID: String) -> String {
         "action.\(actionID).option.\(optionID)"
@@ -39,6 +35,23 @@ public enum PopupBarAlignment: String, Codable, CaseIterable, Sendable {
     case right
 }
 
+/// Which side of the main bar the contextual actions island sits on ("auto" | "left" | "right").
+/// `auto` follows the bar's alignment: right-aligned puts the island on the right, otherwise left.
+public enum ContextualPillPosition: String, Codable, CaseIterable, Sendable {
+    case auto
+    case left
+    case right
+
+    /// True when the island should be drawn after (to the right of) the standard island.
+    public func isTrailing(for alignment: PopupBarAlignment) -> Bool {
+        switch self {
+        case .left: return false
+        case .right: return true
+        case .auto: return alignment == .right
+        }
+    }
+}
+
 /// Vertical placement mode of the popup bar relative to the cursor/selection ("auto" | "above" | "below").
 public enum PopupVerticalPosition: String, Codable, CaseIterable, Sendable {
     case auto
@@ -46,9 +59,7 @@ public enum PopupVerticalPosition: String, Codable, CaseIterable, Sendable {
     case below
 }
 
-/// Which Sparkle update feed the app follows ("stable" | "beta"). Beta builds are pre-releases
-/// tagged with Sparkle's `beta` channel and served from a separate appcast, so opting in never
-/// affects users on the stable channel.
+/// Sparkle update feed. Beta uses a separate appcast, so opting in never affects stable users.
 public enum UpdateChannel: String, Codable, CaseIterable, Sendable {
     case stable
     case beta
@@ -59,8 +70,11 @@ public extension SettingKey where Value == [String] {
 }
 
 public extension SettingKey where Value == Set<String> {
+    static var standaloneAIActionIDs: SettingKey<Set<String>> { SettingKey<Set<String>>("standaloneAIActionIDs", defaultValue: []) }
     static var disabledActionIDs: SettingKey<Set<String>> { SettingKey<Set<String>>("disabledActionIDs", defaultValue: []) }
     static var disabledPackages: SettingKey<Set<String>> { SettingKey<Set<String>>("disabledPackages", defaultValue: []) }
+    /// Actions that stay silent when they finish; every other action, including new ones, plays the sound.
+    static var actionSoundDisabledActionIDs: SettingKey<Set<String>> { SettingKey<Set<String>>("actionSoundDisabledActionIDs", defaultValue: []) }
     static var disabledContextualActionIDs: SettingKey<Set<String>> { SettingKey<Set<String>>("disabledContextualActionIDs", defaultValue: []) }
 }
 
@@ -84,26 +98,30 @@ public extension SettingKey where Value == [String: String] {
 }
 
 public extension SettingKey where Value == Bool {
+    static var showSearchAllActions: SettingKey<Bool> { SettingKey<Bool>("showSearchAllActions", defaultValue: true) }
     static var isAppEnabled: SettingKey<Bool> { SettingKey<Bool>("isAppEnabled", defaultValue: true) }
     static var isAIEnabled: SettingKey<Bool> { SettingKey<Bool>("aiEnabled", defaultValue: true) }
     static var isMouseHoldEnabled: SettingKey<Bool> { SettingKey<Bool>("isMouseHoldEnabled", defaultValue: true) }
     static var hasCompletedOnboarding: SettingKey<Bool> { SettingKey<Bool>("hasCompletedOnboarding", defaultValue: false) }
-    /// True once the one-time post-onboarding coach-mark ("select any text" / "finish setup")
-    /// has been dismissed by any path — it never shows again for this install.
+    /// Once dismissed by any path, the post-onboarding coach-mark never shows again.
     static var hasDismissedPostOnboardingCoachMark: SettingKey<Bool> { SettingKey<Bool>("hasDismissedPostOnboardingCoachMark", defaultValue: false) }
     static var startAtLogin: SettingKey<Bool> { SettingKey<Bool>("startAtLogin", defaultValue: false) }
+    /// Plays a short system sound when an action copies to the clipboard.
+    static var playActionSound: SettingKey<Bool> { SettingKey<Bool>("playActionSound", defaultValue: false) }
+    static var captureTextAutoCopy: SettingKey<Bool> { SettingKey<Bool>("captureTextAutoCopy", defaultValue: true) }
     static var completionCopyToClipboard: SettingKey<Bool> { SettingKey<Bool>("completionCopyToClipboard", defaultValue: false) }
     /// True once the one-time migration (auto-trust existing installs) has run.
     static var extensionTrustMigrated: SettingKey<Bool> { SettingKey<Bool>("extension.trustMigrated", defaultValue: false) }
     static var automaticallyChecksForUpdates: SettingKey<Bool> { SettingKey<Bool>("automaticallyChecksForUpdates", defaultValue: true) }
-    static var automaticallyDownloadsUpdates: SettingKey<Bool> { SettingKey<Bool>("automaticallyDownloadsUpdates", defaultValue: true) }
+    static var automaticallyDownloadsUpdates: SettingKey<Bool> { SettingKey<Bool>("automaticallyDownloadsUpdates", defaultValue: false) }
+    static var automaticallyUpdatesExtensions: SettingKey<Bool> { SettingKey<Bool>("extension.automaticallyUpdates", defaultValue: true) }
     static var notifyOnUpdate: SettingKey<Bool> { SettingKey<Bool>("notifyOnUpdate", defaultValue: true) }
     static var contextualActionsEnabled: SettingKey<Bool> { SettingKey<Bool>("contextualActionsEnabled", defaultValue: true) }
 }
 
 public extension SettingKey where Value == Int {
-    /// Number of actions displayed per page in the popup bar (legacy, default 7).
-    static var popupPageSize: SettingKey<Int> { SettingKey<Int>("popupPageSize", defaultValue: 7) }
+    /// Target number of actions displayed per page in the popup bar (2...24, default 6).
+    static var popupPageSize: SettingKey<Int> { SettingKey<Int>("popupPageSize", defaultValue: 6) }
     /// Maximum width budget level for the popup bar from 1 to 5 (3 = Standard / Default ~540pt).
     static var popupBarWidth: SettingKey<Int> { SettingKey<Int>("popupBarWidth", defaultValue: 3) }
     /// Visual scaling level for the popup from 1 to 5 (3 = Normal / Default).
@@ -124,6 +142,14 @@ public extension SettingKey where Value == Data? {
 }
 
 public extension SettingKey where Value == String {
+    /// Which action sound plays (an `ActionSound` raw value); unknown values fall back to the default.
+    static var actionSoundName: SettingKey<String> { SettingKey<String>("actionSoundName", defaultValue: "click") }
+    /// Display name of the imported custom action sound; empty when none is imported.
+    static var actionSoundCustomName: SettingKey<String> { SettingKey<String>("actionSoundCustomName", defaultValue: "") }
+    static var lastAppUpdateNotificationIdentifier: SettingKey<String> { SettingKey<String>("lastAppUpdateNotificationIdentifier", defaultValue: "") }
+    static var lastAnnouncedAppUpdateVersion: SettingKey<String> { SettingKey<String>("lastAnnouncedAppUpdateVersion", defaultValue: "") }
+    /// Which side of the main bar the contextual actions island sits on; see `ContextualPillPosition`.
+    static var contextualPillPosition: SettingKey<String> { SettingKey<String>("contextualPillPosition", defaultValue: ContextualPillPosition.auto.rawValue) }
     static var calendarProvider: SettingKey<String> { SettingKey<String>("action.calendar.provider", defaultValue: "native") }
     static var searchURL: SettingKey<String> { SettingKey<String>("action.search.url", defaultValue: "https://www.google.com/search?q={query}") }
 
@@ -139,8 +165,7 @@ public extension SettingKey where Value == String {
     /// Popup vertical placement relative to cursor/selection ("auto" | "above" | "below").
     static var popupVerticalPosition: SettingKey<String> { SettingKey<String>("popupVerticalPosition", defaultValue: PopupVerticalPosition.auto.rawValue) }
 
-    /// The last version string (CFBundleShortVersionString) the app was launched on.
-    /// Used to classify launch scenarios (First Install, App Update, Reinstall, Normal Launch).
+    /// Last launched CFBundleShortVersionString; used to classify launch scenarios.
     static var lastRunVersion: SettingKey<String> { SettingKey<String>("app.lastRunVersion", defaultValue: "") }
     /// The last build number (CFBundleVersion) the app was launched on.
     static var lastRunBuild: SettingKey<String> { SettingKey<String>("app.lastRunBuild", defaultValue: "") }
@@ -148,10 +173,8 @@ public extension SettingKey where Value == String {
     /// Which update feed the app follows: `UpdateChannel.stable` (default) or `UpdateChannel.beta`.
     static var updateChannel: SettingKey<String> { SettingKey<String>("updates.channel", defaultValue: UpdateChannel.stable.rawValue) }
 
-    /// Per-action option value key. The key name matches the legacy `action.<id>.option.<optID>`
-    /// convention so existing stored values migrate over with zero data changes.
+    /// Matches the legacy `action.<id>.option.<optID>` key so stored values migrate unchanged.
     static func actionOption(actionID: String, optionID: String, default defaultValue: String = "") -> SettingKey<String> {
         SettingKey<String>("action.\(actionID).option.\(optionID)", defaultValue: defaultValue)
     }
 }
-

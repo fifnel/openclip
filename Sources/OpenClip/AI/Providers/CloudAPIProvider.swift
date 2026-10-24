@@ -13,43 +13,54 @@ public final class CloudAPIProvider: AIProvider {
     public let model: String
     public let serviceProvider: CloudServiceProvider
     public let customBaseURL: String
+    /// Replacement for the system prompt's role and behavior rules (Settings → AI → System Prompt);
+    /// nil uses the built-in text.
+    public let customGuidelines: String?
 
-    public init(apiKey: String, model: String, serviceProvider: CloudServiceProvider = .openai, customBaseURL: String = "") {
+    public init(apiKey: String, model: String, serviceProvider: CloudServiceProvider = .openai, customBaseURL: String = "", customGuidelines: String? = nil) {
+        self.customGuidelines = customGuidelines
         self.apiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.model = trimmedModel.isEmpty ? (serviceProvider.defaultModels.first ?? "gpt-4o-mini") : trimmedModel
+        self.model = trimmedModel.isEmpty ? (serviceProvider.defaultModels.first ?? "gpt-5-mini") : trimmedModel
         self.serviceProvider = serviceProvider
         self.customBaseURL = customBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     public func processStream(prompt: String, text: String) -> AsyncThrowingStream<String, Error> {
-        AsyncThrowingStream { continuation in
-            let validated: (prompt: String, text: String)
-            do {
-                validated = try AIRequestSupport.validateInput(prompt: prompt, text: text)
-            } catch {
-                continuation.finish(throwing: error)
-                return
-            }
+        let validated: (prompt: String, text: String)
+        do {
+            validated = try AIRequestSupport.validateInput(prompt: prompt, text: text)
+        } catch {
+            return AsyncThrowingStream { $0.finish(throwing: error) }
+        }
+        let systemInstruction = AIRequestSupport.systemPrompt(for: validated.prompt, hasInputText: !validated.text.isEmpty, customGuidelines: customGuidelines)
+        let userContent = AIRequestSupport.userContent(for: validated.text, fallbackPrompt: validated.prompt)
+        return stream(systemPrompt: systemInstruction, messages: [.init(role: .user, content: userContent)])
+    }
 
+    public func processStream(refining conversation: AIConversation, instruction: String, currentText: String) -> AsyncThrowingStream<String, Error> {
+        guard let request = conversation.followUpRequest(instruction: instruction, customGuidelines: customGuidelines) else {
+            return processStream(prompt: conversation.followUpTask(current: instruction), text: currentText)
+        }
+        return stream(systemPrompt: request.system, messages: request.messages)
+    }
+
+    private func stream(systemPrompt systemInstruction: String, messages: [AIChatMessage]) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
             guard !apiKey.isEmpty else {
                 continuation.finish(throwing: AIError.missingAPIKey)
                 return
             }
-
-            let hasInputText = !validated.text.isEmpty
-            let systemInstruction = AIRequestSupport.systemPrompt(for: validated.prompt, hasInputText: hasInputText)
-            let userContent = AIRequestSupport.userContent(for: validated.text, fallbackPrompt: validated.prompt)
 
             let streamTask: Task<Void, Never>
             switch serviceProvider {
             case .anthropic:
                 streamTask = Task {
                     do {
-                        for try await chunk in self.streamAnthropic(systemPrompt: systemInstruction, userContent: userContent) {
+                        for try await chunk in self.streamAnthropic(systemPrompt: systemInstruction, messages: messages) {
                             continuation.yield(chunk)
                         }
-                        continuation.finish()
+                        AIRequestSupport.finishStream(continuation)
                     } catch {
                         continuation.finish(throwing: error)
                     }
@@ -57,10 +68,10 @@ public final class CloudAPIProvider: AIProvider {
             case .google:
                 streamTask = Task {
                     do {
-                        for try await chunk in self.streamGemini(systemPrompt: systemInstruction, userContent: userContent) {
+                        for try await chunk in self.streamGemini(systemPrompt: systemInstruction, messages: messages) {
                             continuation.yield(chunk)
                         }
-                        continuation.finish()
+                        AIRequestSupport.finishStream(continuation)
                     } catch {
                         continuation.finish(throwing: error)
                     }
@@ -69,10 +80,10 @@ public final class CloudAPIProvider: AIProvider {
                 let baseURL = effectiveBaseURL
                 streamTask = Task {
                     do {
-                        for try await chunk in self.streamOpenAICompatible(systemPrompt: systemInstruction, userContent: userContent, baseURL: baseURL) {
+                        for try await chunk in self.streamOpenAICompatible(systemPrompt: systemInstruction, messages: messages, baseURL: baseURL) {
                             continuation.yield(chunk)
                         }
-                        continuation.finish()
+                        AIRequestSupport.finishStream(continuation)
                     } catch {
                         continuation.finish(throwing: error)
                     }
@@ -106,7 +117,7 @@ public final class CloudAPIProvider: AIProvider {
 
     // MARK: - OpenAI-compatible chat completions
 
-    private func streamOpenAICompatible(systemPrompt: String, userContent: String, baseURL: String) -> AsyncThrowingStream<String, Error> {
+    private func streamOpenAICompatible(systemPrompt: String, messages: [AIChatMessage], baseURL: String) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -125,10 +136,8 @@ public final class CloudAPIProvider: AIProvider {
                     let systemRole = isOpenAIReasoningModel(model) ? "developer" : "system"
                     let body = OpenAIChatRequest(
                         model: model,
-                        messages: [
-                            .init(role: systemRole, content: systemPrompt),
-                            .init(role: "user", content: userContent)
-                        ],
+                        messages: [.init(role: systemRole, content: systemPrompt)]
+                            + messages.map { .init(role: $0.role.rawValue, content: $0.content) },
                         stream: true
                     )
                     request.httpBody = try JSONEncoder().encode(body)
@@ -172,7 +181,7 @@ public final class CloudAPIProvider: AIProvider {
                             continuation.yield(content)
                         }
                     }
-                    continuation.finish()
+                    AIRequestSupport.finishStream(continuation)
                 } catch {
                     continuation.finish(throwing: error)
                 }
@@ -185,7 +194,7 @@ public final class CloudAPIProvider: AIProvider {
 
     // MARK: - Anthropic Messages API
 
-    private func streamAnthropic(systemPrompt: String, userContent: String) -> AsyncThrowingStream<String, Error> {
+    private func streamAnthropic(systemPrompt: String, messages: [AIChatMessage]) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -206,7 +215,7 @@ public final class CloudAPIProvider: AIProvider {
                         model: model,
                         maxTokens: 4096,
                         system: systemPrompt,
-                        messages: [.init(role: "user", content: userContent)],
+                        messages: messages.map { .init(role: $0.role.rawValue, content: $0.content) },
                         stream: true
                     )
                     request.httpBody = try JSONEncoder().encode(body)
@@ -249,7 +258,7 @@ public final class CloudAPIProvider: AIProvider {
                             continuation.yield(text)
                         }
                     }
-                    continuation.finish()
+                    AIRequestSupport.finishStream(continuation)
                 } catch {
                     continuation.finish(throwing: error)
                 }
@@ -262,7 +271,7 @@ public final class CloudAPIProvider: AIProvider {
 
     // MARK: - Google Gemini API
 
-    private func streamGemini(systemPrompt: String, userContent: String) -> AsyncThrowingStream<String, Error> {
+    private func streamGemini(systemPrompt: String, messages: [AIChatMessage]) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -281,7 +290,7 @@ public final class CloudAPIProvider: AIProvider {
 
                     let body = GeminiChatRequest(
                         systemInstruction: .init(parts: [.init(text: systemPrompt)]),
-                        contents: [.init(parts: [.init(text: userContent)])]
+                        contents: messages.map { .init(role: $0.role == .assistant ? "model" : "user", parts: [.init(text: $0.content)]) }
                     )
                     request.httpBody = try JSONEncoder().encode(body)
 
@@ -313,7 +322,7 @@ public final class CloudAPIProvider: AIProvider {
                             continuation.yield(text)
                         }
                     }
-                    continuation.finish()
+                    AIRequestSupport.finishStream(continuation)
                 } catch {
                     continuation.finish(throwing: error)
                 }
@@ -326,7 +335,7 @@ public final class CloudAPIProvider: AIProvider {
 
     public static func fetchAvailableModels(apiKey: String, provider: CloudServiceProvider, customBaseURL: String = "") async throws -> [String] {
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedKey.isEmpty else {
+        guard !trimmedKey.isEmpty || provider == .openrouter else {
             throw AIError.missingAPIKey
         }
 
@@ -348,7 +357,9 @@ public final class CloudAPIProvider: AIProvider {
             throw AIError.invalidURL(endpoint)
         }
         var request = URLRequest(url: url, timeoutInterval: 10)
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        if !apiKey.isEmpty {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
@@ -358,22 +369,15 @@ public final class CloudAPIProvider: AIProvider {
         struct ModelListResponse: Decodable {
             struct ModelItem: Decodable {
                 let id: String
+                let created: Int?
             }
             let data: [ModelItem]?
         }
 
         let decoded = try JSONDecoder().decode(ModelListResponse.self, from: data)
-        let modelIds = (decoded.data ?? []).map { $0.id }
-        
-        if provider == .openai {
-            let filtered = modelIds.filter { id in
-                let l = id.lowercased()
-                return l.contains("gpt") || l.contains("o1") || l.contains("o3") || l.contains("chat")
-            }.sorted()
-            return filtered.isEmpty ? modelIds.sorted() : filtered
-        } else {
-            return modelIds.sorted()
-        }
+        let entries = (decoded.data ?? []).map { CloudModelEntry(id: $0.id, created: $0.created) }
+        let chat = entries.filter { CloudModelCatalog.isChatModel($0.id) }
+        return CloudModelCatalog.ordered(chat.isEmpty ? entries : chat)
     }
 
     private static func fetchAnthropicModels(apiKey: String, baseURL: String) async throws -> [String] {
@@ -398,8 +402,9 @@ public final class CloudAPIProvider: AIProvider {
             let data: [ModelItem]?
         }
 
+        // Anthropic already returns newest first, so the order is kept.
         let decoded = try JSONDecoder().decode(AnthropicModelListResponse.self, from: data)
-        return (decoded.data ?? []).map { $0.id }.sorted()
+        return (decoded.data ?? []).map { $0.id }
     }
 
     private static func fetchGeminiModels(apiKey: String, baseURL: String) async throws -> [String] {
@@ -419,15 +424,18 @@ public final class CloudAPIProvider: AIProvider {
         struct GeminiModelListResponse: Decodable {
             struct ModelItem: Decodable {
                 let name: String
+                let supportedGenerationMethods: [String]?
             }
             let models: [ModelItem]?
         }
 
         let decoded = try JSONDecoder().decode(GeminiModelListResponse.self, from: data)
-        let ids = (decoded.models ?? []).map { item in
-            item.name.replacingOccurrences(of: "models/", with: "")
-        }.filter { $0.contains("gemini") }.sorted()
+        let entries = (decoded.models ?? [])
+            .filter { $0.supportedGenerationMethods?.contains("generateContent") ?? true }
+            .map { CloudModelEntry(id: $0.name.replacingOccurrences(of: "models/", with: ""), created: nil) }
+            .filter { $0.id.contains("gemini") && CloudModelCatalog.isChatModel($0.id) }
 
-        return ids.isEmpty ? ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"] : ids
+        let ids = CloudModelCatalog.ordered(entries)
+        return ids.isEmpty ? CloudServiceProvider.google.defaultModels : ids
     }
 }

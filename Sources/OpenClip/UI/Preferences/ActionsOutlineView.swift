@@ -1,14 +1,11 @@
 // ActionsOutlineView.swift
 // OpenClip
 //
-// Native AppKit NSOutlineView wrapper for the Customize page.
-// Implements hierarchical tree presentation, native macOS folder drop highlighting,
-// spring-loaded folder expansion, multi-selection, and reordering. Rows carry no controls: the
-// page is the popup bar's layout, and an action's settings are a page of their own.
+// Native AppKit NSOutlineView wrapper for the Customize page: tree presentation, folder drop
+// highlighting, spring-loaded expansion, multi-selection, and reordering. Rows carry no controls.
 //
-// What can be dragged where: a top-level action reorders, drops onto another action to group the
-// two, or drops into a custom group; a custom group's member can leave it; and a command of an
-// extension can be reordered among its siblings but not taken out of its package.
+// Drag rules: a top-level action reorders, drops onto another action or into a custom group; a
+// group member can leave its group; an extension command reorders within its package only.
 
 import AppKit
 import SwiftUI
@@ -40,16 +37,25 @@ final class OutlineNode: NSObject {
         id: String,
         kind: Kind,
         children: [OutlineNode] = [],
-        customization: ActionCustomizationManager
+        customization: ActionCustomizationManager,
+        disabledActionIDs: Set<String> = [],
+        disabledPackages: Set<String> = []
     ) {
         self.id = id
         self.kind = kind
         self.children = children
-        self.signature = Self.computeSignature(id: id, kind: kind, children: children, using: customization)
+        self.signature = Self.computeSignature(
+            id: id,
+            kind: kind,
+            children: children,
+            using: customization,
+            disabledActionIDs: disabledActionIDs,
+            disabledPackages: disabledPackages
+        )
         super.init()
     }
 
-    /// Convenience initializer for tests or synthetic nodes where a custom signature is provided directly.
+    /// For tests and synthetic nodes with an explicit signature.
     init(id: String, kind: Kind, children: [OutlineNode] = [], signature: String = "") {
         self.id = id
         self.kind = kind
@@ -100,32 +106,39 @@ final class OutlineNode: NSObject {
         id: String,
         kind: Kind,
         children: [OutlineNode],
-        using customization: ActionCustomizationManager
+        using customization: ActionCustomizationManager,
+        disabledActionIDs: Set<String> = [],
+        disabledPackages: Set<String> = []
     ) -> String {
         var sig = id + ":"
         switch kind {
         case .customGroup(let def, let action):
             let p = customization.presented(action, surface: .table)
-            sig += "cg:\(def.title):\(def.iconName):\(def.memberActionIDs.joined(separator: ",")):\(p.title):\(String(describing: p.icon))"
+            let dis = disabledActionIDs.contains(def.id)
+            sig += "cg:\(def.title):\(def.iconName):\(def.memberActionIDs.joined(separator: ",")):\(p.title):\(String(describing: p.icon)):dis=\(dis)"
         case .extensionGroup(let action):
             let p = customization.presented(action, surface: .table)
-            sig += "eg:\(p.title):\(String(describing: p.icon))"
+            let dis = disabledActionIDs.contains(action.id) || (ActionIdentity.extensionPackageID(of: action).map { disabledPackages.contains($0) } ?? false)
+            sig += "eg:\(p.title):\(String(describing: p.icon)):dis=\(dis)"
         case .standaloneAction(let action):
             let p = customization.presented(action, surface: .table)
-            sig += "sa:\(p.title):\(String(describing: p.icon))"
+            let dis = disabledActionIDs.contains(action.id) || (ActionIdentity.extensionPackageID(of: action).map { disabledPackages.contains($0) } ?? false)
+            sig += "sa:\(p.title):\(String(describing: p.icon)):dis=\(dis)"
         case .packageHeader(let pkgID, let title, let gatedReason):
-            sig += "ph:\(pkgID):\(title):\(String(describing: gatedReason))"
+            let dis = disabledPackages.contains(pkgID)
+            sig += "ph:\(pkgID):\(title):\(String(describing: gatedReason)):dis=\(dis)"
         case .groupMember(let action, let parentGroupID):
             let p = customization.presented(action, surface: .table)
-            sig += "gm:\(parentGroupID):\(p.title):\(String(describing: p.icon))"
+            let dis = disabledActionIDs.contains(action.id)
+            sig += "gm:\(parentGroupID):\(p.title):\(String(describing: p.icon)):dis=\(dis)"
         case .extensionSubAction(let action, let parentGroupID):
             let p = customization.presented(action, surface: .table)
-            // Option schema is part of the identity so a hot-reloaded manifest that adds, drops,
-            // or modifies options re-renders the row's settings cog even when title and icon are unchanged.
+            let dis = disabledActionIDs.contains(action.id) || (ActionIdentity.extensionPackageID(of: action).map { disabledPackages.contains($0) } ?? false)
+            // Options are part of the signature so a hot-reloaded manifest re-renders the settings cog.
             let optionsSig = action.actionOptions.map { opt in
                 "\(opt.identifier):\(opt.type.rawValue):\(opt.label):\(opt.defaultValue ?? ""):\(opt.options?.joined(separator: "|") ?? "")"
             }.joined(separator: ",")
-            sig += "es:\(parentGroupID):\(p.title):\(String(describing: p.icon)):\(optionsSig)"
+            sig += "es:\(parentGroupID):\(p.title):\(String(describing: p.icon)):\(optionsSig):dis=\(dis)"
         }
         if !children.isEmpty {
             sig += "[" + children.map(\.signature).joined(separator: ";") + "]"
@@ -176,8 +189,7 @@ private final class OutlineCellView: NSTableCellView {
 
 @MainActor
 final class OutlineTableRowView: NSTableRowView {
-    /// Set by the outline view as the pointer moves, never tracked per row: a reused row would
-    /// otherwise keep a stale highlight and leave hover "residue" behind while scrolling.
+    /// Set by the outline view, not tracked per row, so reused rows never keep a stale highlight.
     var isHovered = false {
         didSet {
             guard isHovered != oldValue else { return }
@@ -185,8 +197,7 @@ final class OutlineTableRowView: NSTableRowView {
         }
     }
 
-    /// Softly rounded corners, matching the sidebar's selection, so a highlighted row reads as a
-    /// rounded chip rather than a box.
+    /// Rounded chip corners, matching the sidebar selection.
     private static let cornerRadius: CGFloat = 10
 
     override func prepareForReuse() {
@@ -194,8 +205,7 @@ final class OutlineTableRowView: NSTableRowView {
         isHovered = false
     }
 
-    /// Plain rows: no zebra, no separators. A soft rounded wash shows the row under the pointer;
-    /// the current selection draws the same rounded chip a little stronger.
+    /// Hover wash, and a slightly stronger chip for the selection.
     override func drawBackground(in dirtyRect: NSRect) {
         guard isHovered, !isSelected else { return }
         fillRounded(NSColor.labelColor.withAlphaComponent(isDark ? 0.06 : 0.05))
@@ -210,9 +220,13 @@ final class OutlineTableRowView: NSTableRowView {
         effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
     }
 
-    /// The hairline between rows, so the list reads as one stacked table rather than loose rows.
-    /// Inset from the leading edge the way a system list's separator is.
+    /// Inset hairline between rows, as in a system list.
     override func drawSeparator(in dirtyRect: NSRect) {
+        guard !isHovered, !isSelected else { return }
+        if let outline = enclosingScrollView?.documentView as? ActionsOutlineTableView {
+            let row = outline.row(for: self)
+            guard row < 0 || (outline.hoveredRowIndex != row + 1 && !outline.selectedRowIndexes.contains(row + 1)) else { return }
+        }
         let inset: CGFloat = 12
         let y: CGFloat = isFlipped ? bounds.maxY - 0.5 : bounds.minY + 0.5
         let path = NSBezierPath()
@@ -225,14 +239,32 @@ final class OutlineTableRowView: NSTableRowView {
     }
 
     private func fillRounded(_ color: NSColor) {
-        let rect = bounds.insetBy(dx: 4, dy: 2)
+        let rect = bounds.insetBy(dx: 4, dy: 0)
         let path = NSBezierPath(roundedRect: rect, xRadius: Self.cornerRadius, yRadius: Self.cornerRadius)
         color.setFill()
+        if isSelected,
+           let outline = enclosingScrollView?.documentView as? NSOutlineView {
+            let row = outline.row(for: self)
+            if row >= 0 {
+                // Adjacent selected rows join: square only the shared edges.
+                let joinsAbove = row > 0 && outline.selectedRowIndexes.contains(row - 1)
+                let joinsBelow = outline.selectedRowIndexes.contains(row + 1)
+                let squareTop = isFlipped ? joinsAbove : joinsBelow
+                let squareBottom = isFlipped ? joinsBelow : joinsAbove
+                if squareTop {
+                    path.appendRect(NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height / 2))
+                }
+                if squareBottom {
+                    path.appendRect(NSRect(x: rect.minX, y: rect.midY, width: rect.width, height: rect.height / 2))
+                }
+                path.windingRule = .nonZero
+            }
+        }
         path.fill()
     }
 
     override func drawDraggingDestinationFeedback(in dirtyRect: NSRect) {
-        let rect = bounds.insetBy(dx: 4, dy: 2)
+        let rect = bounds.insetBy(dx: 4, dy: 0)
         let path = NSBezierPath(roundedRect: rect, xRadius: Self.cornerRadius, yRadius: Self.cornerRadius)
         NSColor.controlAccentColor.withAlphaComponent(0.16).setFill()
         path.fill()
@@ -244,19 +276,86 @@ final class OutlineTableRowView: NSTableRowView {
     }
 }
 
+@MainActor
+private final class GroupDropHighlight: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let shape = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 10, yRadius: 10)
+        NSColor.controlAccentColor.withAlphaComponent(0.12).setFill()
+        shape.fill()
+    }
+}
+
 // MARK: - Outline Table View
 
 @MainActor
 final class ActionsOutlineTableView: NSOutlineView {
-    /// The row currently under the pointer. Owned by the table, not by the row, so a row that is
-    /// recycled for different content can never keep someone else's hover.
+    /// Owned by the table, not the row, so recycled rows never keep someone else's hover.
     private weak var hoveredRow: OutlineTableRowView?
     private var hoverTrackingArea: NSTrackingArea?
+    private var pendingRename: Task<Void, Never>?
+    private var lastClickTime: TimeInterval = 0
+    private var didBeginDrag = false
+    private var groupDropHighlight: GroupDropHighlight?
+    private var dropGroup: OutlineNode?
+    private(set) var highlightedDropGroupID: String?
+
+    func cancelPendingRename() {
+        pendingRename?.cancel()
+        didBeginDrag = true
+    }
+
+    func showGroupDropHighlight(_ node: OutlineNode?) {
+        dropGroup = node
+        highlightedDropGroupID = node?.id
+        updateGroupDropHighlight()
+    }
+
+    private func updateGroupDropHighlight() {
+        guard let group = dropGroup else {
+            groupDropHighlight?.removeFromSuperview()
+            groupDropHighlight = nil
+            return
+        }
+        let headerRow = row(forItem: group)
+        guard headerRow >= 0 else { return }
+        let frame = rect(ofRow: headerRow)
+        let highlight = groupDropHighlight ?? GroupDropHighlight()
+        highlight.frame = frame.insetBy(dx: 4, dy: 0)
+        highlight.needsDisplay = true
+        if groupDropHighlight == nil { addSubview(highlight) }
+        groupDropHighlight = highlight
+    }
+
+    override func draggingExited(_ sender: (any NSDraggingInfo)?) {
+        showGroupDropHighlight(nil)
+        super.draggingExited(sender)
+    }
+
+    override func draggingEnded(_ sender: any NSDraggingInfo) {
+        showGroupDropHighlight(nil)
+        super.draggingEnded(sender)
+    }
+
+
+    var hoveredRowIndex: Int {
+        hoveredRow.map { row(for: $0) } ?? -1
+    }
+
+    override func frameOfOutlineCell(atRow row: Int) -> NSRect {
+        var frame = super.frameOfOutlineCell(atRow: row)
+        if !frame.isEmpty {
+            frame.origin.x = bounds.minX + 8 + CGFloat(level(forRow: row)) * indentationPerLevel
+        }
+        return frame
+    }
 
     override func layout() {
         super.layout()
         autoresizesOutlineColumn = false
         sizeLastColumnToFit()
+        updateGroupDropHighlight()
     }
 
     override func updateTrackingAreas() {
@@ -272,6 +371,42 @@ final class ActionsOutlineTableView: NSOutlineView {
         hoverTrackingArea = area
     }
 
+    override func mouseDown(with event: NSEvent) {
+        pendingRename?.cancel()
+        didBeginDrag = false
+        let point = convert(event.locationInWindow, from: nil)
+        let clicked = row(at: point)
+        let wasSelected = selectedRowIndexes.count == 1 && selectedRow == clicked
+        let isSlowClick = event.timestamp - lastClickTime > NSEvent.doubleClickInterval
+        lastClickTime = event.timestamp
+        let plainClick = event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty
+        let cell = clicked >= 0 ? view(atColumn: 0, row: clicked, makeIfNecessary: false) : nil
+        let local = cell.map { $0.convert(event.locationInWindow, from: nil) }
+        let onName = local.map { $0.x >= 30 && $0.x < (cell?.bounds.width ?? 0) - 90 } ?? false
+        super.mouseDown(with: event)
+        guard !didBeginDrag, wasSelected, isSlowClick, plainClick, onName, event.clickCount == 1 else { return }
+        pendingRename = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(NSEvent.doubleClickInterval))
+            guard !Task.isCancelled, let self, self.selectedRow == clicked else { return }
+            _ = (self.delegate as? ActionsOutlineCoordinator)?.renameSelectedAction()
+        }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        pendingRename?.cancel()
+        super.mouseDragged(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        pendingRename?.cancel()
+        if (event.keyCode == 36 || event.keyCode == 76),
+           event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
+           (delegate as? ActionsOutlineCoordinator)?.renameSelectedAction() == true {
+            return
+        }
+        super.keyDown(with: event)
+    }
+
     override func mouseMoved(with event: NSEvent) {
         updateHover(at: convert(event.locationInWindow, from: nil))
     }
@@ -282,8 +417,7 @@ final class ActionsOutlineTableView: NSOutlineView {
 
     override func scrollWheel(with event: NSEvent) {
         super.scrollWheel(with: event)
-        // Rows slide under a stationary pointer while scrolling, so recompute instead of leaving
-        // the highlight on whichever row the reused view now shows.
+        // Rows slide under a stationary pointer; recompute hover.
         updateHover(at: convert(event.locationInWindow, from: nil))
     }
 
@@ -296,9 +430,13 @@ final class ActionsOutlineTableView: NSOutlineView {
 
     private func setHoveredRow(_ rowView: OutlineTableRowView?) {
         guard hoveredRow !== rowView else { return }
+        let previousIndex = hoveredRowIndex
         hoveredRow?.isHovered = false
         rowView?.isHovered = true
         hoveredRow = rowView
+        for index in [previousIndex, hoveredRowIndex] where index > 0 {
+            self.rowView(atRow: index - 1, makeIfNecessary: false)?.needsDisplay = true
+        }
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {
@@ -316,15 +454,10 @@ final class ActionsOutlineTableView: NSOutlineView {
 
 // MARK: - Scroll View
 
-/// Keeps the list's rows clear of the title bar while the scroll view itself runs
-/// underneath it. The pane hands this view the whole detail column, title bar
-/// included, so scrolled rows fade out beneath the toolbar the way every Form-based
-/// pane's do; AppKit only insets scroll views the window owns directly, so the
-/// overlap is measured and applied here.
+/// Runs under the title bar, so the overlap is measured and applied here: AppKit only insets scroll views the window owns.
 @MainActor
 final class ActionsScrollView: NSScrollView {
-    /// Breathing room between the toolbar and the first row, so the list does not start flush
-    /// against the title bar now that the search field has moved into the toolbar.
+    /// Gap between the toolbar and the first row.
     private static let topPadding: CGFloat = 14
 
     override func layout() {
@@ -334,10 +467,6 @@ final class ActionsScrollView: NSScrollView {
         let desiredTop = overlap + Self.topPadding
         if abs(contentInsets.top - desiredTop) > 0.5 {
             contentInsets = NSEdgeInsets(top: desiredTop, left: 0, bottom: 0, right: 0)
-        }
-        if let outline = documentView as? NSOutlineView {
-            outline.autoresizesOutlineColumn = false
-            outline.sizeLastColumnToFit()
         }
     }
 }
@@ -357,7 +486,6 @@ struct ActionsOutlineView: NSViewRepresentable {
     /// Double-click on a row: opens that row's settings page.
     let onOpenNode: (OutlineNode) -> Void
 
-    /// Creates the AppKit outline bridge with its current filters, selection, and callbacks.
     init(
         coordinator: ActionCoordinator,
         customizationManager: ActionCustomizationManager,
@@ -390,8 +518,7 @@ struct ActionsOutlineView: NSViewRepresentable {
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
-        // The inset is measured against the title bar in `layout()`; the automatic
-        // one only fires for a scroll view the window itself owns.
+        // Inset is measured in `layout()`; the automatic one only applies to window-owned scroll views.
         scrollView.automaticallyAdjustsContentInsets = false
 
         let outlineView = ActionsOutlineTableView()
@@ -402,17 +529,17 @@ struct ActionsOutlineView: NSViewRepresentable {
         outlineView.headerView = nil
         outlineView.selectionHighlightStyle = .regular
         outlineView.style = .inset
-        // Horizontal grid lines turn the flat rows into a stacked table; `OutlineTableRowView`
-        // draws them as the inset hairline a system list uses.
+        // Grid lines are drawn by OutlineTableRowView as inset hairlines.
         outlineView.gridStyleMask = .solidHorizontalGridLineMask
         outlineView.rowHeight = 40
-        outlineView.intercellSpacing = NSSize(width: 0, height: 3)
+        outlineView.intercellSpacing = NSSize(width: 0, height: 0)
         outlineView.backgroundColor = .clear
         outlineView.focusRingType = .none
         outlineView.allowsMultipleSelection = true
         outlineView.indentationPerLevel = 18
         outlineView.autoresizingMask = [.width]
-        outlineView.autoresizesOutlineColumn = false
+        // Resizing the column in every layout pass feeds width back into SwiftUI and can make the window keep changing width.
+        outlineView.autoresizesOutlineColumn = true
         outlineView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
 
         outlineView.dataSource = context.coordinator
@@ -448,6 +575,8 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
     }
     weak var outlineView: ActionsOutlineTableView?
     private(set) var rootNodes: [OutlineNode] = []
+    private var renamingActionID: String?
+    private var resolvedDropTarget: OutlineNode?
     private var expandedNodeIDs: Set<String> = []
     private var isSyncingSelection = false
     private var cancellables = Set<AnyCancellable>()
@@ -495,12 +624,20 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
                 self?.syncWithParent()
             }
             .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .openClipExtensionsDidChange)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.syncWithParent()
+            }
+            .store(in: &cancellables)
     }
 
     @discardableResult
     func rebuildTree() -> Bool {
         let actions = parent.coordinator.actions
         let groupDefs = parent.coordinator.actionGroupDefs
+        let standaloneAIIDs = parent.coordinator.standaloneAIActionIDs
 
         let needle = parent.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         func matchesAction(_ action: any Action) -> Bool {
@@ -531,9 +668,8 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
         var seenPackages = Set<String>()
 
         for action in actions {
-            if ActionIdentity.isAIPreset(action) { continue }
+            if ActionIdentity.isAIPreset(action), !standaloneAIIDs.contains(action.id) { continue }
 
-            // Custom Group parent
             if let def = groupDefs.first(where: { $0.id == action.id }) {
                 seenCustomGroups.insert(def.id)
                 let groupMatches = needle.isEmpty || def.title.lowercased().contains(needle)
@@ -543,7 +679,9 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
                     return OutlineNode(
                         id: memberID,
                         kind: .groupMember(action: memberAction, parentGroupID: def.id),
-                        customization: parent.customizationManager
+                        customization: parent.customizationManager,
+                        disabledActionIDs: parent.disabledActionIDs,
+                        disabledPackages: parent.disabledPackages
                     )
                 }
                 if needle.isEmpty || groupMatches || !memberNodes.isEmpty {
@@ -551,18 +689,19 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
                         id: def.id,
                         kind: .customGroup(def, action),
                         children: memberNodes,
-                        customization: parent.customizationManager
+                        customization: parent.customizationManager,
+                        disabledActionIDs: parent.disabledActionIDs,
+                        disabledPackages: parent.disabledPackages
                     ))
                 }
                 continue
             }
 
-            // Member of custom group (rendered under group parent)
+            // Rendered under its group parent.
             if memberToCustomGroup[action.id] != nil {
                 continue
             }
 
-            // Extension Group parent
             if action.chrome.popupBehavior == .showSubActions {
                 let groupMatches = needle.isEmpty || matchesAction(action)
                 let subActionNodes: [OutlineNode] = actions.compactMap { sub in
@@ -571,7 +710,9 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
                     return OutlineNode(
                         id: sub.id,
                         kind: .extensionSubAction(action: sub, parentGroupID: action.id),
-                        customization: parent.customizationManager
+                        customization: parent.customizationManager,
+                        disabledActionIDs: parent.disabledActionIDs,
+                        disabledPackages: parent.disabledPackages
                     )
                 }
                 if needle.isEmpty || groupMatches || !subActionNodes.isEmpty {
@@ -579,18 +720,19 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
                         id: action.id,
                         kind: .extensionGroup(action),
                         children: subActionNodes,
-                        customization: parent.customizationManager
+                        customization: parent.customizationManager,
+                        disabledActionIDs: parent.disabledActionIDs,
+                        disabledPackages: parent.disabledPackages
                     ))
                 }
                 continue
             }
 
-            // Sub-action of extension group (rendered under extension group parent)
+            // Sub-action of an extension group: rendered under its parent.
             if let pkgID = ActionIdentity.extensionPackageID(of: action), groupPackageIDs.contains(pkgID) {
                 continue
             }
 
-            // Non-group multi-action package header
             if let pkgID = ActionIdentity.extensionPackageID(of: action) {
                 let pkgActions = actions.filter { ActionIdentity.extensionPackageID(of: $0) == pkgID }
                 if pkgActions.count >= 2 && !seenPackages.contains(pkgID) {
@@ -607,27 +749,26 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
                         newRoots.append(OutlineNode(
                             id: "pkg.\(pkgID)",
                             kind: .packageHeader(packageID: pkgID, title: title, gatedReason: gatedReason),
-                            customization: parent.customizationManager
+                            customization: parent.customizationManager,
+                            disabledActionIDs: parent.disabledActionIDs,
+                            disabledPackages: parent.disabledPackages
                         ))
                     }
                 }
             }
 
-            // AI Tools Group parent
             if action.chrome.launchesAI {
-                var aiPresets = actions.filter { ActionIdentity.isAIPreset($0) }
-                if aiPresets.isEmpty {
-                    aiPresets = AIServiceManager.shared.presets.map { preset in
-                        AIAction(presetID: preset.id, title: preset.title)
-                    }
-                }
+                let aiPresets = SubActionResolver().subActions(of: action, in: actions)
+                guard !aiPresets.isEmpty else { continue }
                 let groupMatches = needle.isEmpty || matchesAction(action)
                 let subActionNodes: [OutlineNode] = aiPresets.compactMap { preset in
                     if !needle.isEmpty && !groupMatches && !matchesAction(preset) { return nil }
                     return OutlineNode(
                         id: preset.id,
                         kind: .groupMember(action: preset, parentGroupID: action.id),
-                        customization: parent.customizationManager
+                        customization: parent.customizationManager,
+                        disabledActionIDs: parent.disabledActionIDs,
+                        disabledPackages: parent.disabledPackages
                     )
                 }
                 if needle.isEmpty || groupMatches || !subActionNodes.isEmpty {
@@ -635,23 +776,26 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
                         id: action.id,
                         kind: .extensionGroup(action),
                         children: subActionNodes,
-                        customization: parent.customizationManager
+                        customization: parent.customizationManager,
+                        disabledActionIDs: parent.disabledActionIDs,
+                        disabledPackages: parent.disabledPackages
                     ))
                 }
                 continue
             }
 
-            // Standalone action
             if needle.isEmpty || matchesAction(action) {
                 newRoots.append(OutlineNode(
                     id: action.id,
                     kind: .standaloneAction(action),
-                    customization: parent.customizationManager
+                    customization: parent.customizationManager,
+                    disabledActionIDs: parent.disabledActionIDs,
+                    disabledPackages: parent.disabledPackages
                 ))
             }
         }
 
-        // Catch custom groups not yet matched in actions
+        // Groups whose parent action is missing from `actions`.
         for def in groupDefs where !seenCustomGroups.contains(def.id) {
             let groupMatches = needle.isEmpty || def.title.lowercased().contains(needle)
             let memberNodes: [OutlineNode] = def.memberActionIDs.compactMap { memberID in
@@ -660,7 +804,9 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
                 return OutlineNode(
                     id: memberID,
                     kind: .groupMember(action: memberAction, parentGroupID: def.id),
-                    customization: parent.customizationManager
+                    customization: parent.customizationManager,
+                    disabledActionIDs: parent.disabledActionIDs,
+                    disabledPackages: parent.disabledPackages
                 )
             }
             if let dummyAction = actions.first(where: { $0.id == def.id }) {
@@ -669,7 +815,9 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
                         id: def.id,
                         kind: .customGroup(def, dummyAction),
                         children: memberNodes,
-                        customization: parent.customizationManager
+                        customization: parent.customizationManager,
+                        disabledActionIDs: parent.disabledActionIDs,
+                        disabledPackages: parent.disabledPackages
                     ))
                 }
             }
@@ -700,7 +848,6 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
             }
         }
 
-        // Sync selection from parent
         guard !isSyncingSelection else { return }
         var targetIndexes = IndexSet()
         for row in 0..<outlineView.numberOfRows {
@@ -763,7 +910,8 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
                     title: title,
                     packageID: packageID,
                     gatedReason: gatedReason,
-                    disabledPackages: parent.$disabledPackages
+                    disabledPackages: parent.$disabledPackages,
+                    disabledActionIDs: parent.$disabledActionIDs
                 )
             )
 
@@ -777,7 +925,11 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
                     action: action,
                     presentationModel: presentation,
                     disabledActionIDs: parent.$disabledActionIDs,
-                    disabledPackages: parent.$disabledPackages
+                    disabledPackages: parent.$disabledPackages,
+                    isRenaming: renamingActionID == action.id,
+                    onRename: { [weak self] title in
+                        self?.finishRenaming(action: action, title: title)
+                    }
                 )
             )
         }
@@ -824,6 +976,16 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
 
     // MARK: - Drag and Drop
 
+    func outlineView(_ outlineView: NSOutlineView, draggingSession session: NSDraggingSession,
+                     willBeginAt screenPoint: NSPoint, forItems draggedItems: [Any]) {
+        (outlineView as? ActionsOutlineTableView)?.cancelPendingRename()
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, draggingSession session: NSDraggingSession,
+                     endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        (outlineView as? ActionsOutlineTableView)?.showGroupDropHighlight(nil)
+    }
+
     func outlineView(_ outlineView: NSOutlineView, pasteboardWriterForItem item: Any) -> (any NSPasteboardWriting)? {
         guard parent.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         guard let node = item as? OutlineNode else { return nil }
@@ -831,8 +993,7 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
         case .packageHeader:
             return nil
         case .extensionSubAction(let action, _):
-            // Draggable so its order inside its own package can be changed; `validateDrop` is
-            // what keeps it from leaving.
+            // Draggable to reorder within its package; `validateDrop` stops it leaving.
             let pbItem = NSPasteboardItem()
             pbItem.setString(action.id, forType: actionPasteboardType)
             return pbItem
@@ -853,65 +1014,120 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
         proposedItem item: Any?,
         proposedChildIndex index: Int
     ) -> NSDragOperation {
+        resolvedDropTarget = item as? OutlineNode
+        let operation = validateDestination(outlineView, info: info, item: item, index: index)
+        let highlightedGroup: OutlineNode?
+        if operation.isEmpty {
+            highlightedGroup = nil
+        } else if let target = resolvedDropTarget, target.isGroup {
+            highlightedGroup = target
+        } else if let target = resolvedDropTarget, case .groupMember(_, let groupID) = target.kind {
+            highlightedGroup = rootNodes.first { $0.id == groupID }
+        } else {
+            highlightedGroup = nil
+        }
+        (outlineView as? ActionsOutlineTableView)?.showGroupDropHighlight(highlightedGroup)
+        return operation
+    }
+
+    private func validateDestination(
+        _ outlineView: NSOutlineView,
+        info: NSDraggingInfo,
+        item: Any?,
+        index: Int
+    ) -> NSDragOperation {
         guard parent.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
         guard let draggedID = info.draggingPasteboard.string(forType: actionPasteboardType) else {
             return []
         }
         let draggedIDs = draggedActionIDs(from: info)
+
+        // The last child gap and the gap after an expanded group share a y position; the leading gutter picks the root gap.
+        if let group = item as? OutlineNode, group.isGroup, index == group.children.count,
+           info.draggingLocation != .zero,
+           !group.children.isEmpty, outlineView.isItemExpanded(group),
+           draggedIDs.contains(where: { extensionGroupID(ofSubActionWithID: $0) == nil }),
+           let lastChild = group.children.last,
+           let rootIndex = rootNodes.firstIndex(where: { $0.id == group.id }) {
+            let lastRow = outlineView.row(forItem: lastChild)
+            if lastRow >= 0 {
+                let point = outlineView.convert(info.draggingLocation, from: nil)
+                let childFrame = outlineView.frameOfCell(atColumn: 0, row: lastRow)
+                if Self.isRootGapAfterGroup(point: point, lastRow: outlineView.rect(ofRow: lastRow),
+                    childContentMinX: childFrame.minX + 30) {
+                    resolvedDropTarget = nil
+                    outlineView.setDropItem(nil, dropChildIndex: rootIndex + 1)
+                    return .move
+                }
+            }
+        }
+
+        // AI presets can return to their launcher. Other actions cannot join AI Tools.
+        if let targetNode = item as? OutlineNode, targetNode.action?.chrome.launchesAI == true,
+           index == NSOutlineViewDropOnItemIndex || index >= 0 {
+            let allPresets = draggedIDs.allSatisfy { id in
+                parent.coordinator.actions.contains { $0.id == id && ActionIdentity.isAIPreset($0) }
+            }
+            if !draggedIDs.isEmpty && allPresets { return .move }
+        }
         let extensionOwners = Set(draggedIDs.compactMap { extensionGroupID(ofSubActionWithID: $0) })
         let dragIsAllExtensionCommands = !draggedIDs.isEmpty && extensionOwners.count > 0
             && draggedIDs.allSatisfy { extensionGroupID(ofSubActionWithID: $0) != nil }
 
-        // Case 0: A command of an extension belongs to its package — it can be reordered among
-        // its siblings and moved nowhere else. When the whole drag is extension commands, every
-        // dragged id is judged, not just the first: they must all belong to the single package the
-        // drop target is, or the drop is refused. A mixed drag falls through to the cases below so
-        // its non-command members can still join a group or reorder.
+        // Case 0: extension commands stay in their package. Every dragged id must belong to the target's
+        // package, or the drop is refused. A mixed drag falls through so its other members still work.
         if dragIsAllExtensionCommands {
             guard extensionOwners.count == 1,
                   let owningGroupID = extensionOwners.first,
-                  let targetNode = item as? OutlineNode,
-                  case .extensionGroup(let groupAction) = targetNode.kind,
-                  groupAction.id == owningGroupID,
-                  index >= 0 else { return [] }
-            return .move
-        }
-
-        // Case 1: Hovering over or inside a custom group. A multi-row selection is judged by
-        // whichever dragged actions could actually join, not just the first pasteboard item.
-        if let targetNode = item as? OutlineNode, case .customGroup(let def, _) = targetNode.kind {
-            if index >= 0 && def.memberActionIDs.contains(draggedID) {
+                  let targetNode = item as? OutlineNode else { return [] }
+            if case .extensionGroup(let groupAction) = targetNode.kind,
+               groupAction.id == owningGroupID, index >= 0 { return .move }
+            if index == NSOutlineViewDropOnItemIndex,
+               let parentNode = outlineView.parent(forItem: targetNode) as? OutlineNode,
+               parentNode.id == owningGroupID,
+               let childIndex = parentNode.children.firstIndex(where: { $0.id == targetNode.id }) {
+                resolvedDropTarget = parentNode
+                outlineView.setDropItem(parentNode, dropChildIndex: childIndex)
                 return .move
             }
-            let candidates = draggedIDs.filter { couldJoinGroup($0, def: def) }
+            return []
+        }
+
+        // Case 1: custom group. Judge a multi-row selection by the members that could join.
+        if let targetNode = item as? OutlineNode, case .customGroup(let def, _) = targetNode.kind {
+            let candidates = draggedIDs.filter {
+                def.memberActionIDs.contains($0) || couldJoinGroup($0, def: def)
+            }
             guard !candidates.isEmpty else { return [] }
             if index == NSOutlineViewDropOnItemIndex || index >= 0 {
                 return .move
             }
         }
 
-        // Case 2: Hovering ON another action -> the drop makes a group of the two, the way
-        // dragging one icon onto another does on the Home screen. AppKit draws the row highlight
-        // for a drop-on-item, so the affordance is already there.
+        // Case 2: drop ON another action makes a group of the two.
         if let targetNode = item as? OutlineNode,
            index == NSOutlineViewDropOnItemIndex,
+           draggedIDs.count == 1,
            dropOntoOutcome(draggedID: draggedID, target: targetNode) != nil {
             return .move
         }
 
-        // Case 3: Hovering ON an item that can hold nothing -> retarget to insert between rows!
+        // Case 3: drop on an item that cannot hold it: retarget to insert between rows.
         if item != nil && index == NSOutlineViewDropOnItemIndex {
             if let targetNode = item as? OutlineNode,
                let parentItem = outlineView.parent(forItem: targetNode) as? OutlineNode {
                 let isSameCustomGroup = parent.coordinator.actionGroupDefs.first(where: { $0.id == parentItem.id })?.memberActionIDs.contains(draggedID) == true
                 let isSameExtensionGroup = extensionGroupID(ofSubActionWithID: draggedID) == parentItem.id
-                if (isSameCustomGroup || isSameExtensionGroup),
+                let isSameAIGroup = parentItem.action?.chrome.launchesAI == true && draggedIDs.allSatisfy { id in
+                    parentItem.children.contains { $0.id == id }
+                }
+                if (isSameCustomGroup || isSameExtensionGroup || isSameAIGroup),
                    let childIndex = parentItem.children.firstIndex(where: { $0.id == targetNode.id }) {
+                    resolvedDropTarget = parentItem
                     outlineView.setDropItem(parentItem, dropChildIndex: childIndex)
                     return .move
                 }
             }
-            // Resolve the top-level ancestor of the hovered item and use its root index.
             var topLevel = item
             while let candidate = topLevel, let parent = outlineView.parent(forItem: candidate) {
                 topLevel = parent
@@ -919,15 +1135,17 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
             if let node = topLevel as? OutlineNode,
                let rootIndex = rootNodes.firstIndex(where: { $0.id == node.id }),
                extensionGroupID(ofSubActionWithID: draggedID) == nil {
+                resolvedDropTarget = nil
                 outlineView.setDropItem(nil, dropChildIndex: rootIndex)
                 return .move
             }
         }
 
-        // Case 4: Hovering at root level (reordering top-level actions). An extension command can
-        // never leave its package, so a drag carrying one is filtered down to its eligible members.
+        // Case 4: root-level reorder. Extension commands never leave their package.
         if item == nil && index >= 0,
            draggedIDs.contains(where: { extensionGroupID(ofSubActionWithID: $0) == nil }) {
+            // Reset the indicator to root indentation; AppKit otherwise keeps the child insertion line.
+            outlineView.setDropItem(nil, dropChildIndex: index)
             return .move
         }
 
@@ -940,18 +1158,42 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
         item: Any?,
         childIndex index: Int
     ) -> Bool {
+        (outlineView as? ActionsOutlineTableView)?.showGroupDropHighlight(nil)
+        guard parent.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
         guard let draggedID = info.draggingPasteboard.string(forType: actionPasteboardType) else {
             return false
         }
 
-        // Reordered inside its own extension group
+        if let targetNode = item as? OutlineNode, targetNode.action?.chrome.launchesAI == true,
+           index == NSOutlineViewDropOnItemIndex || index >= 0 {
+            let ids = draggedActionIDs(from: info)
+            guard !ids.isEmpty, ids.allSatisfy({ id in
+                parent.coordinator.actions.contains { $0.id == id && ActionIdentity.isAIPreset($0) }
+            }) else { return false }
+            parent.coordinator.setAIActionPlacement(actionIDs: ids, standalone: false)
+            if index >= 0 {
+                let previousMembers = targetNode.children.map(\.id)
+                let members = Self.inserting(previousMembers, moving: ids, toChildIndex: index)
+                parent.coordinator.setExtensionGroupMemberOrder(groupID: targetNode.id, memberIDs: members)
+            }
+            expandedNodeIDs.insert(targetNode.id)
+            rebuildTree()
+            outlineView.reloadData()
+            if let updated = rootNodes.first(where: { $0.id == targetNode.id }) {
+                outlineView.expandItem(updated)
+            }
+            return true
+        }
+
         if let owningGroupID = extensionGroupID(ofSubActionWithID: draggedID),
            let targetNode = item as? OutlineNode,
            case .extensionGroup(let groupAction) = targetNode.kind,
            groupAction.id == owningGroupID,
            index >= 0 {
             let members = parent.coordinator.memberActionIDs(for: owningGroupID)
-            let reordered = Self.reordered(members, moving: draggedID, toChildIndex: index)
+            let ids = draggedActionIDs(from: info)
+            guard ids.allSatisfy({ extensionGroupID(ofSubActionWithID: $0) == owningGroupID }) else { return false }
+            let reordered = Self.inserting(members, moving: ids, toChildIndex: index)
             guard reordered != members else { return false }
             parent.coordinator.setExtensionGroupMemberOrder(groupID: owningGroupID, memberIDs: reordered)
             expandedNodeIDs.insert(owningGroupID)
@@ -963,64 +1205,56 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
             return true
         }
 
-        // Reordered inside its own custom group
-        if let targetNode = item as? OutlineNode,
-           case .customGroup(let def, _) = targetNode.kind,
-           def.memberActionIDs.contains(draggedID),
-           index >= 0 {
-            let members = def.memberActionIDs
-            let reordered = Self.reordered(members, moving: draggedID, toChildIndex: index)
-            guard reordered != members else { return false }
-            parent.coordinator.updateGroup(
-                groupID: def.id,
-                title: def.title,
-                iconName: def.iconName,
-                memberActionIDs: reordered
-            )
+        // The gap index counts selected members, so they are removed before inserting.
+        if let targetNode = item as? OutlineNode, case .customGroup(let def, _) = targetNode.kind,
+           index == NSOutlineViewDropOnItemIndex || index >= 0 {
+            let ids = draggedActionIDs(from: info).filter {
+                def.memberActionIDs.contains($0) || couldJoinGroup($0, def: def)
+            }
+            guard !ids.isEmpty else { return false }
+            let members = Self.inserting(def.memberActionIDs, moving: ids,
+                toChildIndex: index < 0 ? def.memberActionIDs.count : index)
+            for id in ids where !def.memberActionIDs.contains(id) {
+                parent.coordinator.addToGroup(actionID: id, groupID: def.id)
+            }
+            parent.coordinator.updateGroup(groupID: def.id, title: def.title,
+                iconName: def.iconName, memberActionIDs: members)
             expandedNodeIDs.insert(def.id)
             rebuildTree()
             outlineView.reloadData()
-            if let updated = rootNodes.first(where: { $0.id == def.id }) {
-                outlineView.expandItem(updated)
-            }
+            if let updated = rootNodes.first(where: { $0.id == def.id }) { outlineView.expandItem(updated) }
             return true
         }
 
-        // Dropped ON or INSIDE a custom group. A multi-row selection arrives as several pasteboard
-        // items, so add every eligible one in the dragged order.
-        if let targetNode = item as? OutlineNode, case .customGroup(let def, _) = targetNode.kind {
-            let candidates = draggedActionIDs(from: info).filter { couldJoinGroup($0, def: def) }
-            if !candidates.isEmpty {
-                for (offset, id) in candidates.enumerated() {
-                    if index == NSOutlineViewDropOnItemIndex {
-                        parent.coordinator.addToGroup(actionID: id, groupID: def.id)
-                    } else if index >= 0 {
-                        parent.coordinator.addToGroup(actionID: id, groupID: def.id, atIndex: index + offset)
-                    }
-                }
-                expandedNodeIDs.insert(def.id)
-                outlineView.expandItem(targetNode)
-                rebuildTree()
-                outlineView.reloadData()
-                return true
-            }
-        }
-
-        // Dropped ON another action: group the two, or join the group the target is already in.
+        // Drop ON an action: group the two, or join the target's group.
         if let targetNode = item as? OutlineNode,
            index == NSOutlineViewDropOnItemIndex,
+           draggedActionIDs(from: info).count == 1,
            let outcome = dropOntoOutcome(draggedID: draggedID, target: targetNode) {
             return perform(outcome, draggedID: draggedID, in: outlineView)
         }
 
-        // Dropped at root level. A multi-row selection arrives as several pasteboard items, so
-        // every dragged action is ejected from whichever group held it and the whole run is
-        // moved together. Extension commands are filtered out here too: they can never leave
-        // their package, and `validateDrop` refuses a drag that consists only of them.
+        // Root drop: eject each dragged action from its group and move the run together. Extension commands are filtered out.
         if item == nil && index >= 0 {
-            let draggedIDs = draggedActionIDs(from: info)
-                .filter { extensionGroupID(ofSubActionWithID: $0) == nil }
+            let rawIDs = draggedActionIDs(from: info)
+            let selectedParents = rootNodes.filter { rawIDs.contains($0.id) && $0.isGroup }
+            let carriedChildren = Set(selectedParents.flatMap { $0.children.map(\.id) })
+            let draggedIDs = rawIDs.filter {
+                extensionGroupID(ofSubActionWithID: $0) == nil && !carriedChildren.contains($0)
+            }
             guard !draggedIDs.isEmpty else { return false }
+            let rootActionIDs = Set(rootNodes.compactMap { $0.action?.id })
+            let destinationCandidates = rootNodes.dropFirst(min(index, rootNodes.count)).compactMap { node -> String? in
+                if let action = node.action { return action.id }
+                if case .packageHeader(let packageID, _, _) = node.kind {
+                    return parent.coordinator.actions.first {
+                        rootActionIDs.contains($0.id) && ActionIdentity.extensionPackageID(of: $0) == packageID
+                    }?.id
+                }
+                return nil
+            }
+
+            parent.coordinator.setAIActionPlacement(actionIDs: draggedIDs, standalone: true)
 
             for id in draggedIDs {
                 if let sourceGroupID = parent.coordinator.actionGroupDefs.first(where: { $0.memberActionIDs.contains(id) })?.id {
@@ -1028,17 +1262,11 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
                 }
             }
 
-            let roots = self.rootNodes
-            let destinationActionIndex: Int
-            if index < roots.count {
-                let targetNode = roots[index]
-                destinationActionIndex = parent.coordinator.actions.firstIndex(where: { $0.id == targetNode.id }) ?? parent.coordinator.actions.count
-            } else {
-                destinationActionIndex = parent.coordinator.actions.count
-            }
+            let destinationActionIndex = destinationCandidates.lazy.compactMap { candidate in
+                self.parent.coordinator.actions.firstIndex { $0.id == candidate }
+            }.first ?? parent.coordinator.actions.count
 
-            // Move each dragged root node together with everything that travels with it — a group
-            // header takes its members, an extension group its sub-actions.
+            // A group moves together with its members.
             var movingIDs: [String] = []
             var seen = Set<String>()
             for id in draggedIDs {
@@ -1081,22 +1309,29 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
         return nil
     }
 
-    /// Moves `id` to the gap an outline view reports for a drop between children.
-    ///
-    /// That index counts the rows *as they are on screen*, with the dragged row still among them,
-    /// so moving a row downwards lands one place too far once it has been lifted out. Pure, so the
-    /// off-by-one is pinned by tests rather than argued about.
+    /// Moves `id` to an outline gap index, which counts the dragged row while it is still on screen.
     static func reordered(_ members: [String], moving id: String, toChildIndex index: Int) -> [String] {
-        guard let from = members.firstIndex(of: id) else { return members }
-        var reordered = members
-        reordered.remove(at: from)
-        let destination = index > from ? index - 1 : index
-        reordered.insert(id, at: min(max(destination, 0), reordered.count))
-        return reordered
+        guard members.contains(id) else { return members }
+        return inserting(members, moving: [id], toChildIndex: index)
     }
 
-    /// Every action id in a drag, in pasteboard order. A multi-row selection drags as several
-    /// pasteboard items; a single row as one.
+    static func inserting(_ members: [String], moving ids: [String], toChildIndex index: Int) -> [String] {
+        var seen = Set<String>()
+        let moving = ids.filter { seen.insert($0).inserted }
+        let gap = min(max(index, 0), members.count)
+        let destination = gap - members.prefix(gap).filter { seen.contains($0) }.count
+        var result = members.filter { !seen.contains($0) }
+        result.insert(contentsOf: moving, at: destination)
+        return result
+    }
+
+    static func isRootGapAfterGroup(point: NSPoint, lastRow: NSRect, childContentMinX: CGFloat) -> Bool {
+        guard point.x >= lastRow.minX, point.x <= lastRow.maxX,
+              point.y >= lastRow.maxY - 4, point.y <= lastRow.maxY + 8 else { return false }
+        return point.x < childContentMinX || point.y > lastRow.maxY + 2
+    }
+
+    /// Every action id in a drag, in pasteboard order (multi-row drags arrive as several items).
     private func draggedActionIDs(from info: NSDraggingInfo) -> [String] {
         let ids = (info.draggingPasteboard.pasteboardItems ?? [])
             .compactMap { $0.string(forType: actionPasteboardType) }
@@ -1104,8 +1339,7 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
         return info.draggingPasteboard.string(forType: actionPasteboardType).map { [$0] } ?? []
     }
 
-    /// Whether a dragged id may join `def`: a groupable top-level action that is not the group
-    /// itself, not another group, not an extension group, and not already a member.
+    /// Whether a dragged id may join `def`: a groupable top-level action, not a group or extension group.
     private func couldJoinGroup(_ id: String, def: ActionGroupDef) -> Bool {
         guard id != def.id else { return false }
         guard !parent.coordinator.actionGroupDefs.contains(where: { $0.id == id }) else { return false }
@@ -1120,8 +1354,7 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
 
     // MARK: - Grouping by drop
 
-    /// What dropping `draggedID` *onto* `target` should do, or nil when the target cannot hold it
-    /// and the drop should fall through to reordering.
+    /// Outcome of dropping `draggedID` onto `target`, or nil to fall through to reordering.
     enum DropOntoOutcome: Equatable {
         /// Neither action is in a group: make one holding both, the target first.
         case makeGroup(withTargetID: String)
@@ -1145,8 +1378,7 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
             return .joinGroup(id: parentGroupID, afterMemberID: action.id)
 
         case .customGroup, .extensionGroup, .extensionSubAction, .packageHeader:
-            // A custom group is handled before this; the rest belong to an extension package and
-            // cannot take a member.
+            // Custom groups are handled earlier; extension nodes cannot take members.
             return nil
         }
     }
@@ -1179,7 +1411,7 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
 
         guard let groupID else { return false }
 
-        // Open the group so the drop's result is visible rather than hidden behind a chevron.
+        // Expand so the result is visible.
         expandedNodeIDs.insert(groupID)
         rebuildTree()
         outlineView.reloadData()
@@ -1189,8 +1421,7 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
         return true
     }
 
-    /// A name for a group made by dropping, which has no chance to ask for one: the plain name
-    /// until it is taken, then the numbered form. Pure, so the numbering is pinned by tests.
+    /// Name for a drop-created group: the plain name, then numbered once taken.
     static func uniqueGroupTitle(
         base: String,
         numbered: (Int) -> String,
@@ -1214,8 +1445,50 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
         parent.onOpenNode(node)
     }
 
+    func renameSelectedAction() -> Bool {
+        guard let outlineView, outlineView.selectedRowIndexes.count == 1,
+              let node = outlineView.item(atRow: outlineView.selectedRow) as? OutlineNode,
+              node.action != nil else { return false }
+        beginRenaming(node)
+        return true
+    }
+
+    private func beginRenaming(_ node: OutlineNode) {
+        guard node.action != nil else { return }
+        renamingActionID = node.id
+        outlineView?.reloadItem(node)
+    }
+
+    @objc private func handleRenameMenuItem(_ sender: NSMenuItem) {
+        guard let node = sender.representedObject as? OutlineNode else { return }
+        beginRenaming(node)
+    }
+
+    private func finishRenaming(action: any Action, title: String?) {
+        guard renamingActionID == action.id else { return }
+        renamingActionID = nil
+        if let title {
+            let existing = parent.customizationManager.override(for: action.id)
+            parent.customizationManager.setOverride(
+                for: action.id,
+                title: title,
+                symbol: existing?.customIconSymbol,
+                text: existing?.customIconText
+            )
+        }
+        rebuildTree()
+        outlineView?.reloadData()
+    }
+
     func contextMenu(for node: OutlineNode) -> NSMenu {
         let menu = NSMenu()
+        let selectedActions = selectedActionNodes(fallback: node).compactMap(\.action)
+        if node.action != nil, selectedActions.count == 1 {
+            let renameItem = NSMenuItem(title: String(localized: "Rename"), action: #selector(handleRenameMenuItem(_:)), keyEquivalent: "")
+            renameItem.target = self
+            renameItem.representedObject = node
+            menu.addItem(renameItem)
+        }
 
         switch node.kind {
         case .customGroup(let def, _):
@@ -1238,6 +1511,17 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
             menu.addItem(removeItem)
 
         case .standaloneAction(let action):
+            if ActionIdentity.isAIPreset(action),
+               let launcher = parent.coordinator.actions.first(where: { $0.chrome.launchesAI }) {
+                let addToGroupItem = NSMenuItem(title: String(localized: "Add to Group"), action: nil, keyEquivalent: "")
+                let subMenu = NSMenu()
+                let groupItem = NSMenuItem(title: launcher.title, action: #selector(handleAddToGroupMenuItem(_:)), keyEquivalent: "")
+                groupItem.target = self
+                groupItem.representedObject = (actionIDs: selectedActions.filter { ActionIdentity.isAIPreset($0) }.map(\.id), groupID: launcher.id)
+                subMenu.addItem(groupItem)
+                addToGroupItem.submenu = subMenu
+                menu.addItem(addToGroupItem)
+            }
             if parent.coordinator.isEligibleForGrouping(actionID: action.id) {
                 if !parent.coordinator.actionGroupDefs.isEmpty {
                     let addToGroupItem = NSMenuItem(title: String(localized: "Add to Group"), action: nil, keyEquivalent: "")
@@ -1245,7 +1529,7 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
                     for def in parent.coordinator.actionGroupDefs {
                         let groupItem = NSMenuItem(title: def.title, action: #selector(handleAddToGroupMenuItem(_:)), keyEquivalent: "")
                         groupItem.target = self
-                        groupItem.representedObject = (actionID: action.id, groupID: def.id)
+                        groupItem.representedObject = (actionIDs: selectedActions.filter { parent.coordinator.isEligibleForGrouping(actionID: $0.id) }.map(\.id), groupID: def.id)
                         subMenu.addItem(groupItem)
                     }
                     addToGroupItem.submenu = subMenu
@@ -1259,13 +1543,17 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
                 }
             }
 
+        case .extensionGroup(let action) where action.chrome.launchesAI:
+            let ungroupItem = NSMenuItem(title: String(localized: "Ungroup"), action: #selector(handleUngroupMenuItem(_:)), keyEquivalent: "")
+            ungroupItem.target = self
+            ungroupItem.representedObject = action.id
+            menu.addItem(ungroupItem)
+
         case .extensionGroup, .extensionSubAction, .packageHeader:
             break
         }
 
-        // Selection-based Duplicate / Delete: a right-click inside a multi-row selection acts on
-        // every selected action, not just the one under the pointer. Custom groups are excluded —
-        // their own Configure/Ungroup items already cover them, and duplication targets actions.
+        // Duplicate/Delete act on the whole selection; custom groups are excluded (Configure/Ungroup cover them).
         let selectedNodes = selectedActionNodes(fallback: node).filter { !$0.isCustomGroup }
         let duplicable = selectedNodes.compactMap(\.action).filter { ActionIdentity.canDuplicate($0) }
         let deletable = selectedNodes.compactMap(\.action).filter { ActionDeletion.canDelete($0) }
@@ -1289,8 +1577,7 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
         return menu
     }
 
-    /// The nodes the context menu acts on: every selected row, or just `node` when nothing is
-    /// selected (a right-click selects the row under the pointer before the menu is built).
+    /// Selected rows, or just `node` when nothing is selected.
     private func selectedActionNodes(fallback node: OutlineNode) -> [OutlineNode] {
         guard let outlineView else { return [node] }
         let nodes = outlineView.selectedRowIndexes.compactMap { outlineView.item(atRow: $0) as? OutlineNode }
@@ -1344,8 +1631,10 @@ final class ActionsOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
     }
 
     @objc private func handleAddToGroupMenuItem(_ sender: NSMenuItem) {
-        if let tuple = sender.representedObject as? (actionID: String, groupID: String) {
-            parent.coordinator.addToGroup(actionID: tuple.actionID, groupID: tuple.groupID)
+        if let tuple = sender.representedObject as? (actionIDs: [String], groupID: String) {
+            for actionID in tuple.actionIDs {
+                parent.coordinator.addToGroup(actionID: actionID, groupID: tuple.groupID)
+            }
             expandedNodeIDs.insert(tuple.groupID)
             rebuildTree()
             outlineView?.reloadData()

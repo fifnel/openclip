@@ -29,6 +29,23 @@ targets:
           - CFBundleURLName: com.openclip.url
             CFBundleURLSchemes:
               - openclip
+              - openclip-dev
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: OpenClip Extension
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Owner
+            LSItemContentTypes:
+              - com.openclip.extension
+            LSTypeIsPackage: true
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: com.openclip.extension
+            UTTypeDescription: OpenClip Extension
+            UTTypeConformsTo:
+              - com.apple.package
+              - public.composite-content
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - openclipext
         LSUIElement: true
         NSHumanReadableCopyright: "Copyright © 2026 Ganesh M and OpenClip Contributors. AGPL-3.0 licensed."
         NSAppleEventsUsageDescription: "OpenClip needs to control other apps to run your AppleScript actions and to paste results back into the app you were using."
@@ -36,7 +53,7 @@ targets:
         SUPublicEDKey: JbyKx5LUkYkM+ovsJ1NPDR2W+1ptfdsu6b51KBsKhWo=
         SUScheduledCheckInterval: 86400
         SUEnableAutomaticChecks: true
-        SUAutomaticallyUpdate: true
+        SUAutomaticallyUpdate: false
         CFBundleLocalizations:
           - en
           - zh-Hans
@@ -46,12 +63,13 @@ targets:
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
-        MARKETING_VERSION: "1.7.1"
-        CURRENT_PROJECT_VERSION: "17"
+        MARKETING_VERSION: "1.9.1"
+        CURRENT_PROJECT_VERSION: "25"
         INFOPLIST_KEY_CFBundleShortVersionString: $(MARKETING_VERSION)
         INFOPLIST_KEY_CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_ENTITLEMENTS: Sources/OpenClip/OpenClip.entitlements
+        PRODUCT_MODULE_NAME: OpenClip
         # Ad-hoc is the default so a clone builds and runs with no Apple Developer account.
         # scripts/sign_artifact.sh overrides the identity for signed/notarized builds.
         CODE_SIGN_IDENTITY: "-"
@@ -62,6 +80,13 @@ targets:
         SWIFT_STRICT_CONCURRENCY: complete
         SWIFT_EMIT_LOC_STRINGS: YES
         LOCALIZATION_PREFERS_STRING_CATALOGS: YES
+      configs:
+        Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: com.openclip.OpenClip.dev
+          INFOPLIST_KEY_CFBundleDisplayName: OpenClip Dev
+        Release:
+          PRODUCT_BUNDLE_IDENTIFIER: com.openclip.OpenClip
+          INFOPLIST_KEY_CFBundleDisplayName: OpenClip
     dependencies:
       - target: Core
       - package: OpenSelection
@@ -84,8 +109,8 @@ targets:
       - package: OpenSelection
 packages:
   OpenSelection:
-    url: https://github.com/ganeshmshetty/OpenSelection
-    exactVersion: 0.2.8
+    url: https://github.com/ganeshmshetty/OpenSelection.git
+    exactVersion: 2.16.0
   KeyboardShortcuts:
     url: https://github.com/sindresorhus/KeyboardShortcuts
     from: 3.1.0

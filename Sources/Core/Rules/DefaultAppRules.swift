@@ -5,22 +5,45 @@
 import Foundation
 
 public enum DefaultAppRules: Sendable {
-    /// Wildcard-aware bundle-id match: exact equality, or a trailing-`.*` prefix rule
-    /// (`com.google.Chrome.*` matches both `com.google.Chrome` and any child namespace).
-    /// The single source of truth for bundle matching — raw `Set.contains` against the group
-    /// arrays silently misses every pattern entry.
-    public static func matches(pattern: String, bundleID: String) -> Bool {
+    /// `process:<name>` and `path:<executable>` target apps by process name or executable path;
+    /// plain entries match bundle IDs.
+    public static let processNamePrefix = "process:"
+    public static let executablePathPrefix = "path:"
+
+    /// Single source of truth for identifier matching; raw `Set.contains` silently misses wildcard entries.
+    public static func matchesValue(pattern: String, value: String) -> Bool {
         if pattern == "*" { return true }
-        if pattern == bundleID { return true }
+        if pattern == value { return true }
         if pattern.hasSuffix(".*") {
             let prefix = String(pattern.dropLast(2))
-            return bundleID == prefix || bundleID.hasPrefix(prefix + ".")
+            return value == prefix || value.hasPrefix(prefix + ".")
         }
         if pattern.hasSuffix("*") {
             let prefix = String(pattern.dropLast(1))
-            return bundleID.hasPrefix(prefix)
+            return value.hasPrefix(prefix)
         }
         return false
+    }
+
+    public static func matches(pattern: String, bundleID: String) -> Bool {
+        matchesValue(pattern: pattern, value: bundleID)
+    }
+
+    /// `process:`/`path:` patterns match case-insensitively; a lone `*` also matches apps without a bundle ID.
+    public static func matches(pattern: String, identity: AppIdentity) -> Bool {
+        func scoped(_ prefix: String) -> String? {
+            pattern.hasPrefix(prefix) ? String(pattern.dropFirst(prefix.count)).lowercased() : nil
+        }
+        if let name = scoped(processNamePrefix), let target = identity.processName?.lowercased() {
+            return matchesValue(pattern: name, value: target)
+        }
+        if let path = scoped(executablePathPrefix), let target = identity.executablePath?.lowercased() {
+            return matchesValue(pattern: path, value: target)
+        }
+        if let bundleID = identity.bundleIdentifier, !bundleID.isEmpty {
+            return matches(pattern: pattern, bundleID: bundleID)
+        }
+        return pattern == "*"
     }
 
     public static func matchesAny(_ patterns: [String], bundleID: String) -> Bool {
@@ -90,7 +113,6 @@ public enum DefaultAppRules: Sendable {
         // Code Editors & IDEs
         "com.apple.Terminal",
         "com.googlecode.iterm2",
-        "com.mitchellh.ghostty",
         "com.microsoft.VSCode",
         "com.microsoft.VSCodeInsiders",
         "com.vscodium",
@@ -164,6 +186,7 @@ public enum DefaultAppRules: Sendable {
     ]
     
     public static let menuCopyApps: [String] = [
+        "com.mitchellh.ghostty",
         "org.alacritty",
         "net.kovidgoyal.kitty",
         "co.zeit.hyper",

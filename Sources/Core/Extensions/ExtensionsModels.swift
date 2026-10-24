@@ -13,11 +13,12 @@ public struct ExtensionItem: Sendable, Codable, Identifiable {
     public let downloadCount: Int
     public let downloadURL: String
     public let version: String?
-    /// Absolute URL to the normalized adaptive web icon (currentColor SVG) generated
-    /// by the extensions publish pipeline; absent for older catalog snapshots.
+    /// Normalized currentColor icon SVG URL from the publish pipeline; nil for older snapshots.
     public let iconURL: String?
-    /// ISO 8601 publication or release timestamp from catalog.json; nil if unavailable.
+    /// Last-touch timestamp from catalog.json (moves every release); nil if unavailable.
     public let publishedAt: String?
+    /// First-appearance timestamp, stable across releases; nil in older snapshots.
+    public let addedAt: String?
 
     public init(
         id: String,
@@ -29,7 +30,8 @@ public struct ExtensionItem: Sendable, Codable, Identifiable {
         downloadURL: String,
         version: String? = nil,
         iconURL: String? = nil,
-        publishedAt: String? = nil
+        publishedAt: String? = nil,
+        addedAt: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -41,16 +43,18 @@ public struct ExtensionItem: Sendable, Codable, Identifiable {
         self.version = version
         self.iconURL = iconURL
         self.publishedAt = publishedAt
+        self.addedAt = addedAt
     }
 
-    /// `publishedAt` as a date, or nil when the catalogue did not carry one.
     public var publishedDate: Date? {
         Self.parsePublishedAt(publishedAt)
     }
 
-    /// The catalogue writes an internet timestamp with an offset ("2026-08-20T22:00:51+05:30");
-    /// a date-only value is accepted too, and anything else — or a snapshot from before the field
-    /// existed — is nil rather than a guess. Pure, so the accepted shapes are pinned by tests.
+    public var addedDate: Date? {
+        Self.parsePublishedAt(addedAt)
+    }
+
+    /// Accepts ISO 8601 with offset or date-only; anything else is nil rather than a guess.
     public static func parsePublishedAt(_ raw: String?) -> Date? {
         guard let raw else { return nil }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -10,7 +10,11 @@ import Foundation
 import Core
 
 public struct AIToolsAction: Action, SubActionProviding {
-    public init() {}
+    private let settingsStore: any SettingsStore
+
+    public init(settingsStore: any SettingsStore = DefaultSettingsStore.shared) {
+        self.settingsStore = settingsStore
+    }
 
     public var id: String { "builtin.aiTools" }
     public var title: String { String(localized: "AI Tools") }
@@ -21,7 +25,7 @@ public struct AIToolsAction: Action, SubActionProviding {
 
     @MainActor
     public func isEnabled(for context: ActionContext) -> Bool {
-        AIServiceManager.shared.isAIEnabled
+        settingsStore.get(.isAIEnabled)
     }
 
     /// Defensive fallback: the bar routes via `chrome.launchesAI` and the palette excludes this
@@ -31,17 +35,24 @@ public struct AIToolsAction: Action, SubActionProviding {
         .success
     }
 
-    // The AI Tools launcher's sub-actions are the registered AI presets (chrome source `.ai`).
+    // The AI Tools launcher's sub-actions are the registered AI presets (chrome source `.ai`) that the
+    // user hasn't moved out, in the order arranged on the Actions page (#175). Ordering by the stored
+    // member list, not by catalog position, keeps the hover sub-bar and the click palette in sync with
+    // Preferences even when a surface reorders its catalog (e.g. contextual matches first).
     @MainActor
     public func subActions(in catalog: [any Action]) -> [any Action] {
-        let presets = catalog.filter { action in
-            ActionIdentity.isAIPreset(action)
+        let standaloneIDs = settingsStore.get(.standaloneAIActionIDs)
+        let members = catalog.filter { action in
+            ActionIdentity.isAIPreset(action) && !standaloneIDs.contains(action.id)
         }
-        if !presets.isEmpty {
-            return presets
-        }
-        return AIServiceManager.shared.enabledPresets.map { preset in
-            AIAction(presetID: preset.id, title: preset.title)
-        }
+        let arranged = settingsStore.get(.extensionGroupMemberOrder)[id] ?? []
+        guard !arranged.isEmpty else { return members }
+        let rank = Dictionary(arranged.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
+        return members.enumerated()
+            .sorted { lhs, rhs in
+                let l = rank[lhs.element.id] ?? Int.max, r = rank[rhs.element.id] ?? Int.max
+                return l != r ? l < r : lhs.offset < rhs.offset
+            }
+            .map(\.element)
     }
 }

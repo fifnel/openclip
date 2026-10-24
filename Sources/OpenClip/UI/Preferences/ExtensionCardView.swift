@@ -1,8 +1,7 @@
 // ExtensionCardView.swift
 // OpenClip
 //
-// The store list row for a single extension listing (icon, name, author, description,
-// and install/uninstall actions). Formatted in native macOS table style.
+// Store list row for one extension listing.
 import SwiftUI
 import Core
 
@@ -23,8 +22,7 @@ struct ExtensionCardView: View {
     @State private var installError: String? = nil
 
     private var matchingInstalledAction: (any Action)? {
-        // Generated action IDs are "<manifest.identifier>.action.<n>"; store item.id is
-        // "<manifest.identifier>". Require the separator so unrelated shorter ids cannot match.
+        // Action ids are "<identifier>.action.<n>"; require the "." so shorter ids can't match.
         coordinator.actions.first { action in
             let actID = action.id.lowercased()
             let itemID = item.id.lowercased()
@@ -36,9 +34,7 @@ struct ExtensionCardView: View {
         matchingInstalledAction != nil
     }
 
-    /// The SF Symbol name when the catalog icon string names one — either bare
-    /// ("bold", "text.alignleft") or explicitly prefixed ("symbol:sparkles") —
-    /// or nil for file references like "icon.svg" / remote ids like "simple-icons:swift".
+    /// SF Symbol name when the icon is one (bare or `symbol:`-prefixed); nil for file or remote references.
     private var bareSymbolName: String? {
         var icon = item.icon
         if icon.hasPrefix("symbol:") { icon = String(icon.dropFirst("symbol:".count)) }
@@ -71,9 +67,7 @@ struct ExtensionCardView: View {
         isFeaturedExplicit ?? ExtensionsStoreViewModel.isFeatured(item)
     }
 
-    /// Byline, download count and publication date on one quiet line under the description. The
-    /// last two are what the Store sorts by, so a sorted list can be read without guessing why it
-    /// is in that order.
+    /// Byline, downloads and date; the last two are what the Store sorts by.
     private var metadataLine: String {
         var parts: [String] = []
         if !item.author.isEmpty {
@@ -84,8 +78,9 @@ struct ExtensionCardView: View {
         } else if item.downloadCount > 1 {
             parts.append(String(localized: "\(formattedDownloadCount(item.downloadCount)) downloads"))
         }
-        if let published = item.publishedDate {
-            parts.append(String(localized: "Added \(published.formatted(.dateTime.day().month(.abbreviated).year()))"))
+        // Prefer the stable first-added date; fall back to the last-release date for older snapshots.
+        if let added = item.addedDate ?? item.publishedDate {
+            parts.append(String(localized: "Added \(added.formatted(.dateTime.day().month(.abbreviated).year()))"))
         }
         return parts.joined(separator: " · ")
     }
@@ -104,9 +99,7 @@ struct ExtensionCardView: View {
 
     var body: some View {
         HStack(alignment: .center, spacing: 14) {
-            // Leading icon: normalized adaptive SVG from the publish pipeline when
-            // available (rendered as a tintable template); falls back to a bare SF
-            // Symbol or a deterministic letter tile.
+            // Remote template icon, else a bare SF Symbol, else a letter tile.
             ZStack {
                 if let urlString = item.iconURL, let url = URL(string: urlString) {
                     RemoteTemplateIcon(url: url)
@@ -123,11 +116,7 @@ struct ExtensionCardView: View {
             .background(Color.primary.opacity(0.06))
             .cornerRadius(7)
 
-            // Three levels, three weights: the name is what you scan, the
-            // description is what you read, and the byline and download count
-            // are only there once something has caught your eye. They used to be
-            // the same grey as the description, and the byline sat on the name's
-            // line, so all three competed at once.
+            // Three levels: name (scanned), description (read), byline and downloads (secondary).
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(item.name)
@@ -165,7 +154,6 @@ struct ExtensionCardView: View {
 
             Spacer(minLength: 12)
 
-            // Right Action Buttons
             HStack(spacing: 8) {
                 if isInstalled, updateManager.updatablePackageIDs.contains(item.id) {
                     if #available(macOS 26.0, *) {

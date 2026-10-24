@@ -7,7 +7,7 @@
 // own secondary), and the resolver's default toast already says "Copied" — nothing to add.
 import Foundation
 
-public struct CopyAction: ConfigurableAction {
+public struct CopyAction: ConfigurableAction, OCRInputAction {
     public let id = "builtin.copy"
     public var title: String { String(localized: "Copy") }
     public let preferenceIconName = "doc.on.doc"
@@ -21,11 +21,14 @@ public struct CopyAction: ConfigurableAction {
     
     @MainActor
     public func isEnabled(for context: ActionContext) -> Bool {
-        return !context.selection.text.isEmpty
+        return !context.selection.isClipboardFallback && !context.selection.text.isEmpty
     }
     
     @MainActor
     public func perform(_ context: ActionContext) async throws -> ActionResult {
+        if context.selection.source == .selection {
+            return .copySelection(context.selection)
+        }
         // Preserve every captured representation (including app-private types such as Notes
         // checklists) so a raw copy round-trips exactly; fall back to plain text otherwise.
         if context.selection.html != nil || context.selection.rtf != nil || !context.selection.flavors.isEmpty {
@@ -39,4 +42,3 @@ public struct CopyAction: ConfigurableAction {
         return .copy(context.selection.text)
     }
 }
-

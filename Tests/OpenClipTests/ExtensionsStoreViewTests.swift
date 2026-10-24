@@ -18,8 +18,7 @@ final class ExtensionsStoreViewTests: XCTestCase {
         XCTAssertFalse(viewModel.isLoading)
     }
 
-    /// Typing fast must never surface results for an earlier prefix: when the newer query's
-    /// response lands first, the slow older response is discarded by the generation token.
+    /// A slow older response must never overwrite results for a newer query (generation token).
     @MainActor
     func testOutOfOrderResponsesKeepLatestQueryResults() async throws {
         let api = GatedStoreAPI(arrivals: [
@@ -69,8 +68,7 @@ final class ExtensionsStoreViewTests: XCTestCase {
         XCTAssertEqual(viewModel.extensions.map(\.id), ["spa-row"])
     }
 
-    /// A page-2 prefetch parked mid-flight can neither block a new search nor append its
-    /// rows to the fresh result set; the loading flag belongs to the winning generation.
+    /// A parked page-2 prefetch can neither block a new search nor leak rows into it.
     @MainActor
     func testStalePaginationAppendIsDiscardedAfterNewSearch() async throws {
         let api = GatedStoreAPI()
@@ -83,11 +81,9 @@ final class ExtensionsStoreViewTests: XCTestCase {
         await initial.value
         XCTAssertEqual(viewModel.extensions.map(\.id), ["old-1", "old-2"])
 
-        // Page-2 prefetch starts and parks on the gate…
         let prefetch = Task { await viewModel.fetchNextPage() }
         try await waitUntil { await api.hasPending(query: "old", page: 2) }
 
-        // …then a brand-new result set is requested; it must not be blocked by the parked page…
         viewModel.searchQuery = "new"
         let refreshed = Task { await viewModel.resetAndFetch() }
         try await waitUntil { await api.hasPending(query: "new", page: 1) }
@@ -95,7 +91,7 @@ final class ExtensionsStoreViewTests: XCTestCase {
         await refreshed.value
         XCTAssertEqual(viewModel.extensions.map(\.id), ["new-1"])
 
-        // …and when the stale page finally lands it must not leak into the new list.
+        // The stale page landing late must not leak into the new list.
         await api.release(query: "old", page: 2, names: ["stale-page-2"], totalPages: 9)
         try await Task.sleep(nanoseconds: 50_000_000)
         XCTAssertEqual(viewModel.extensions.map(\.id), ["new-1"])
@@ -120,8 +116,7 @@ final class ExtensionsStoreViewTests: XCTestCase {
         XCTAssertNil(missLimit)
         let missQuery = await cache.response(baseURL: "https://prod.example/api", query: "other", page: 1, limit: 12)
         XCTAssertNil(missQuery)
-        // A second client pointed at a different endpoint must never see prod's pages
-        // (the shared instance is injected into every ExtensionsAPIClient by default).
+        // A different endpoint must never see prod's pages, even though the cache is shared.
         let otherBase = await cache.response(baseURL: "https://stub.test/api", query: "swift ui", page: 1, limit: 12)
         XCTAssertNil(otherBase)
     }
@@ -163,9 +158,11 @@ final class ExtensionsStoreViewTests: XCTestCase {
         XCTAssertEqual(viewModel.displayedExtensions.map(\.id),
                        ["com.openclip.quick-translate", "com.openclip.render-html", "com.openclip.basic-tool"])
         XCTAssertEqual(viewModel.featuredSectionItems.map(\.id), ["com.openclip.quick-translate"])
-        XCTAssertEqual(viewModel.newSectionItems.map(\.id), ["com.openclip.basic-tool"],
-                       "only the package still on its first release counts as new")
-        XCTAssertEqual(viewModel.remainingAllSectionItems.map(\.id), ["com.openclip.render-html"])
+        XCTAssertEqual(viewModel.newSectionItems.map(\.id),
+                       ["com.openclip.quick-translate", "com.openclip.basic-tool", "com.openclip.render-html"],
+                       "new releases lead the New section and updated items fill its remaining slots")
+        XCTAssertTrue(viewModel.remainingAllSectionItems.isEmpty,
+                      "items already shown in Featured or New are omitted from All")
 
         viewModel.selectedSort = .name
         XCTAssertEqual(viewModel.displayedExtensions.map(\.name), ["Basic Tool", "Quick Translate", "Render HTML"])
@@ -178,7 +175,7 @@ final class ExtensionsStoreViewTests: XCTestCase {
 
         viewModel.selectedSort = .recentlyAdded
         let recent = viewModel.displayedExtensions.map(\.id)
-        XCTAssertEqual(recent.first, "com.openclip.render-html", "kept in the curated recent list")
+        XCTAssertEqual(recent.first, "com.openclip.quick-translate", "new releases lead the recent list")
         XCTAssertEqual(Set(recent), everything)
     }
 
@@ -215,14 +212,12 @@ final class ExtensionsStoreViewTests: XCTestCase {
         let offset = ExtensionItem.parsePublishedAt("2026-08-20T22:00:51+05:30")
         XCTAssertEqual(try XCTUnwrap(offset).timeIntervalSince1970, 1_787_243_451, accuracy: 1)
 
-        // And the shapes it might use instead.
         XCTAssertNotNil(ExtensionItem.parsePublishedAt("2026-09-08T20:29:52Z"))
         XCTAssertNotNil(ExtensionItem.parsePublishedAt("2026-09-08T20:29:52.123Z"))
         XCTAssertNotNil(ExtensionItem.parsePublishedAt("2026-09-08"))
         XCTAssertNotNil(ExtensionItem.parsePublishedAt("  2026-09-08T20:29:52Z  "))
 
-        // A snapshot from before the field existed, or a value that makes no sense, is nil rather
-        // than a guess — the row simply says nothing about when it was added.
+        // Pre-field snapshots and nonsense values yield nil, never a guess.
         XCTAssertNil(ExtensionItem.parsePublishedAt(nil))
         XCTAssertNil(ExtensionItem.parsePublishedAt(""))
         XCTAssertNil(ExtensionItem.parsePublishedAt("last tuesday"))
@@ -260,22 +255,19 @@ final class ExtensionsStoreViewTests: XCTestCase {
         XCTAssertEqual(viewModel.selectedSort, .name, "sorting is not a filter, so searching does not undo it")
     }
 
-    /// When the last fetched item belongs to featured/new sections, it does not appear in
-    /// remainingAllSectionItems. Pagination must still trigger from the final rendered sectioned item.
+    /// Pagination still triggers from the last rendered sectioned item when the last fetched item is in a showcase section.
     @MainActor
     func testPaginationTriggeredWhenLastFetchedItemNotInRemainingAllSectionItems() async throws {
         let api = GatedStoreAPI()
         let viewModel = ExtensionsStoreViewModel(api: api)
 
-        // Item 1: standard item (lives in remainingAllSectionItems; past its first
-        // release, so it is not consumed by the New section)
+        // Item 1: a standard item, not consumed by the New section.
         let basic = ExtensionItem(id: "com.openclip.basic-tool", name: "Basic Tool",
                                   description: "", author: "openclip", icon: "", downloadCount: 0, downloadURL: "", version: "1.1.0")
-        // Item 2: a first-release item that fills the New section, so it does not
-        // fall back to the updated `basic`.
+        // Item 2: a first release that fills the New section.
         let fresh = ExtensionItem(id: "com.openclip.fresh-tool", name: "Fresh Tool",
                                   description: "", author: "openclip", icon: "", downloadCount: 0, downloadURL: "", version: "1.0.0")
-        // Item 3: curated featured item (lives in featuredSectionItems, absent from remainingAllSectionItems)
+        // Item 3: curated featured item.
         let featured = ExtensionItem(id: "com.openclip.quick-translate", name: "Quick Translate",
                                      description: "", author: "openclip", icon: "", downloadCount: 1500, downloadURL: "")
 
@@ -286,7 +278,8 @@ final class ExtensionsStoreViewTests: XCTestCase {
 
         XCTAssertEqual(viewModel.currentPage, 2)
         XCTAssertEqual(viewModel.extensions.last?.id, "com.openclip.quick-translate")
-        XCTAssertEqual(viewModel.remainingAllSectionItems.map(\.id), ["com.openclip.basic-tool"])
+        XCTAssertTrue(viewModel.remainingAllSectionItems.isEmpty,
+                      "the New showcase also contains updated items when it has room")
         XCTAssertEqual(viewModel.featuredSectionItems.map(\.id), ["com.openclip.quick-translate"])
 
         // The final rendered item in the sectioned view is the last item of remainingAllSectionItems.
@@ -294,7 +287,6 @@ final class ExtensionsStoreViewTests: XCTestCase {
         XCTAssertTrue(viewModel.shouldTriggerSectionedPagination(for: "com.openclip.basic-tool"))
         XCTAssertFalse(viewModel.shouldTriggerSectionedPagination(for: "com.openclip.quick-translate"))
 
-        // Simulating the onAppear trigger on the last rendered card initiates page 2 fetch.
         let nextPage = Task { await viewModel.fetchNextPage() }
         try await waitUntil { await api.hasPending(query: "", page: 2) }
         let page2Item = ExtensionItem(id: "com.openclip.extra-tool", name: "Extra Tool",
@@ -305,7 +297,7 @@ final class ExtensionsStoreViewTests: XCTestCase {
         XCTAssertEqual(viewModel.currentPage, 3)
         XCTAssertEqual(viewModel.extensions.map(\.id), ["com.openclip.basic-tool", "com.openclip.fresh-tool", "com.openclip.quick-translate", "com.openclip.extra-tool"])
 
-        // Also verify case where remainingAllSectionItems is empty (all items are featured/new):
+        // Also: remainingAllSectionItems empty, every item featured or new.
         let showcaseOnlyVM = ExtensionsStoreViewModel(api: api)
         let renderHtml = ExtensionItem(id: "com.openclip.render-html", name: "Render HTML",
                                        description: "", author: "openclip", icon: "", downloadCount: 100, downloadURL: "", version: "1.0.0")
@@ -315,12 +307,11 @@ final class ExtensionsStoreViewTests: XCTestCase {
         await showcaseInitial.value
 
         XCTAssertTrue(showcaseOnlyVM.remainingAllSectionItems.isEmpty)
-        XCTAssertEqual(showcaseOnlyVM.lastRenderedSectionedItemID, "com.openclip.render-html")
-        XCTAssertTrue(showcaseOnlyVM.shouldTriggerSectionedPagination(for: "com.openclip.render-html"))
+        XCTAssertEqual(showcaseOnlyVM.lastRenderedSectionedItemID, "com.openclip.quick-translate")
+        XCTAssertTrue(showcaseOnlyVM.shouldTriggerSectionedPagination(for: "com.openclip.quick-translate"))
     }
 
-    /// Sorting reorders the catalogue, so the row rendered last is not the item fetched last.
-    /// Pagination hangs off the last *rendered* row, or the next page never loads.
+    /// Sorting reorders rows, so pagination must hang off the last *rendered* row, not the last fetched one.
     @MainActor
     func testPaginationTriggersOnTheLastRenderedRowNotTheLastFetched() async throws {
         let api = GatedStoreAPI()
@@ -346,7 +337,6 @@ final class ExtensionsStoreViewTests: XCTestCase {
         XCTAssertTrue(viewModel.shouldTriggerFlatPagination(for: "com.openclip.quiet"))
         XCTAssertFalse(viewModel.shouldTriggerFlatPagination(for: "com.openclip.loud"))
 
-        // Simulating the onAppear trigger on the last rendered card initiates page 2 fetch.
         let nextPage = Task { await viewModel.fetchNextPage() }
         try await waitUntil { await api.hasPending(query: "", page: 2) }
         let page2Item = ExtensionItem(id: "com.openclip.middling", name: "Middling",
@@ -361,9 +351,7 @@ final class ExtensionsStoreViewTests: XCTestCase {
         XCTAssertTrue(viewModel.shouldTriggerFlatPagination(for: "com.openclip.quiet"))
     }
 
-    /// The Featured section must always return 4 extensions: even before fetching,
-    /// When the API response includes `featured` extensions (as provided by the website API),
-    /// featuredSectionItems returns all curated featured items directly.
+    /// Server-supplied `featured` items populate the Featured section directly.
     @MainActor
     func testServerDrivenFeaturedExtensionsPopulatesFeaturedSection() async throws {
         let api = GatedStoreAPI()
@@ -383,7 +371,6 @@ final class ExtensionsStoreViewTests: XCTestCase {
         await api.release(query: "", page: 1, items: [reminderItem], featured: serverFeatured)
         await fetchTask.value
 
-        // Must have all 4 featured items from the server response
         XCTAssertEqual(viewModel.featuredSectionItems.count, 4)
         XCTAssertEqual(viewModel.featuredSectionItems.map(\.id), [
             "com.openclip.quick-translate",
@@ -393,8 +380,7 @@ final class ExtensionsStoreViewTests: XCTestCase {
         ])
     }
 
-    /// Server-provided `response.featured` dynamically overrides local fallbacks, allowing
-    /// featured extensions to be updated instantly from the website without native app updates.
+    /// Server `featured` overrides local fallbacks, so the website can update them without an app release.
     @MainActor
     func testServerDrivenFeaturedExtensionsOverridesCatalogAndFallbacks() async throws {
         let api = GatedStoreAPI()
@@ -526,6 +512,143 @@ final class ExtensionsStoreViewTests: XCTestCase {
         XCTAssertFalse(viewModel.isFeatured(ext2))
     }
 
+    // MARK: - Whole-catalogue load & the New filter
+
+    /// `loadAll` pages until the last page so client-side sort/filter/count see the full catalogue.
+    @MainActor
+    func testLoadAllFetchesEveryPage() async {
+        let api = PagedStoreAPI(total: 5)
+        let viewModel = ExtensionsStoreViewModel(api: api)
+
+        await viewModel.loadAll(limit: 2)
+
+        XCTAssertEqual(viewModel.extensions.map(\.id),
+                       ["ext-0", "ext-1", "ext-2", "ext-3", "ext-4"])
+        XCTAssertFalse(viewModel.isLoading)
+        let requested = await api.requestedPages()
+        XCTAssertEqual(requested, [1, 2, 3], "pages are fetched until the last one")
+    }
+
+    @MainActor
+    func testFlatNewPageUsesTheNewSelectionNotTheWholeCatalogue() {
+        let viewModel = ExtensionsStoreViewModel(api: RecordingStoreAPI())
+        var items: [ExtensionItem] = []
+        for i in 0..<20 {
+            let added = i < 2 ? "2026-10-06T00:00:00Z" : "2026-08-01T00:00:00Z"
+            items.append(ExtensionItem(id: "ext-\(i)", name: "Ext \(i)", description: "", author: "",
+                                       icon: "", downloadCount: 0, downloadURL: "",
+                                       version: "1.0.0", addedAt: added))
+        }
+        viewModel.extensions = items
+
+        viewModel.selectedSort = .recentlyAdded
+        XCTAssertEqual(viewModel.flatDisplayedExtensions.count, 12,
+                       "the New page is the floored selection, not the whole catalogue")
+        XCTAssertTrue(viewModel.flatDisplayedExtensions.contains { $0.id == "ext-0" })
+
+        viewModel.selectedSort = .downloads
+        XCTAssertEqual(viewModel.flatDisplayedExtensions.count, 20,
+                       "every other page keeps the full set, reordered")
+    }
+
+    /// New keeps recent items after an update, topped up to a floor so a quiet catalogue never shows an empty tab.
+    @MainActor
+    func testNewSelectionUsesWindowWithFloor() throws {
+        let now = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-10-08T00:00:00Z"))
+        func item(_ id: String, added: String, version: String?) -> ExtensionItem {
+            ExtensionItem(id: id, name: id, description: "", author: "", icon: "",
+                          downloadCount: 0, downloadURL: "", version: version, addedAt: added)
+        }
+        // One genuine recent addition that has already shipped an update, plus old stock.
+        let recentUpdated = item("recent-updated", added: "2026-10-05T00:00:00Z", version: "1.1.0")
+        var pool = [recentUpdated]
+        for i in 0..<20 { pool.append(item("old-\(i)", added: "2026-08-01T00:00:00Z", version: "1.0.0")) }
+
+        let floored = ExtensionsStoreViewModel.newSelection(pool, now: now)
+        XCTAssertEqual(floored.count, 12, "topped up to the floor during a quiet period")
+        XCTAssertEqual(floored.first?.id, "recent-updated", "the genuine recent addition leads")
+        XCTAssertTrue(floored.contains { $0.id == "recent-updated" },
+                      "an updated-but-recent extension stays New")
+
+        // When the window already holds at least the floor, only windowed items are returned.
+        var manyRecent: [ExtensionItem] = []
+        for i in 0..<15 { manyRecent.append(item("r-\(i)", added: "2026-10-07T00:00:00Z", version: "1.0.0")) }
+        XCTAssertEqual(ExtensionsStoreViewModel.newSelection(manyRecent, now: now).count, 15)
+    }
+
+    @MainActor
+    func testIsNewIsExactFirstRelease() {
+        func item(_ version: String?) -> ExtensionItem {
+            ExtensionItem(id: "x", name: "X", description: "", author: "", icon: "",
+                          downloadCount: 0, downloadURL: "", version: version)
+        }
+        // Legacy snapshots without `addedAt` fall back to the first-release heuristic.
+        XCTAssertTrue(ExtensionsStoreViewModel.isNew(item("1.0.0")))
+        XCTAssertTrue(ExtensionsStoreViewModel.isNew(item(nil)), "a snapshot without a version is new")
+        XCTAssertFalse(ExtensionsStoreViewModel.isNew(item("1.0.1")))
+        XCTAssertFalse(ExtensionsStoreViewModel.isNew(item("1.0.0-beta")), "only the exact first release")
+    }
+
+    /// New follows the first-added date: an update must not drop a new extension, and publishedAt must not revive an old one.
+    @MainActor
+    func testIsNewUsesStableAddedDateAcrossUpdates() throws {
+        let now = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-10-08T00:00:00Z"))
+        func item(_ id: String, version: String?, added: String?) -> ExtensionItem {
+            ExtensionItem(id: id, name: id, description: "", author: "", icon: "",
+                          downloadCount: 0, downloadURL: "", version: version, addedAt: added)
+        }
+        XCTAssertTrue(ExtensionsStoreViewModel.isNew(
+            item("fresh-updated", version: "1.2.0", added: "2026-10-05T00:00:00Z"), now: now),
+            "added 3 days ago and since updated is still new")
+        XCTAssertTrue(ExtensionsStoreViewModel.isNew(
+            item("fresh", version: "1.0.0", added: "2026-10-07T00:00:00Z"), now: now))
+        XCTAssertFalse(ExtensionsStoreViewModel.isNew(
+            item("old-updated", version: "1.2.0", added: "2026-08-01T00:00:00Z"), now: now),
+            "an old extension is not revived by a recent update")
+        XCTAssertFalse(ExtensionsStoreViewModel.isNew(
+            item("old", version: "1.0.0", added: "2026-09-01T00:00:00Z"), now: now))
+    }
+
+    @MainActor
+    func testNewPageSearchExcludesSavedShowcaseAndKeepsAllMatches() {
+        let viewModel = ExtensionsStoreViewModel(api: RecordingStoreAPI())
+        func item(_ id: String) -> ExtensionItem {
+            ExtensionItem(id: id, name: id, description: "", author: "", icon: "",
+                          downloadCount: 0, downloadURL: "", version: "1.1.0",
+                          addedAt: "2020-01-01T00:00:00Z")
+        }
+        viewModel.selectedSort = .recentlyAdded
+        viewModel.newItems = [item("unrelated-showcase")]
+        viewModel.searchQuery = "matching"
+        viewModel.extensions = (0..<15).map { item("matching-\($0)") }
+
+        XCTAssertEqual(Set(viewModel.flatDisplayedExtensions.map(\.id)),
+                       Set(viewModel.extensions.map(\.id)),
+                       "search must keep every match, without the New floor or saved showcase")
+
+        viewModel.extensions = []
+        XCTAssertTrue(viewModel.flatDisplayedExtensions.isEmpty,
+                      "a query with no matches must show the empty state")
+    }
+
+    @MainActor
+    func testNewSelectionFloorKeepsLegacyFirstRelease() throws {
+        let now = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-10-08T00:00:00Z"))
+        let firstRelease = ExtensionItem(id: "first-release", name: "First Release", description: "",
+                                         author: "", icon: "", downloadCount: 0, downloadURL: "",
+                                         version: "1.0.0", publishedAt: "2020-01-01T00:00:00Z")
+        let updated = (0..<12).map { index in
+            ExtensionItem(id: "updated-\(index)", name: "Updated \(index)", description: "",
+                          author: "", icon: "", downloadCount: 0, downloadURL: "",
+                          version: "1.1.0", publishedAt: "2026-10-07T00:00:00Z")
+        }
+        let selected = ExtensionsStoreViewModel.newSelection([firstRelease] + updated, now: now)
+        XCTAssertEqual(selected.count, 12)
+        XCTAssertTrue(selected.contains { $0.id == firstRelease.id },
+                      "filling the minimum must not discard an eligible legacy first release")
+        XCTAssertEqual(Set(selected.map(\.id)).count, selected.count)
+    }
+
     // MARK: - Helpers
 
     @MainActor
@@ -541,9 +664,7 @@ final class ExtensionsStoreViewTests: XCTestCase {
     }
 }
 
-/// Fetcher whose responses park on gates the test releases in a chosen order — the only way
-/// to deterministically reproduce out-of-order network resolution. Optionally fulfills one
-/// XCTestExpectation per request, in arrival order.
+/// Responses park on gates the test releases in any order, reproducing out-of-order resolution.
 private actor GatedStoreAPI: ExtensionStoreFetching {
     let arrivals: [XCTestExpectation]
     private var pending: [String: CheckedContinuation<ExtensionsPageResponse, Error>] = [:]
@@ -622,5 +743,30 @@ private actor RefreshTrackingStoreAPI: ExtensionStoreFetching {
 
     func invalidateCache() async {
         invalidateCount += 1
+    }
+}
+
+/// Immediate-response fetcher that behaves like a real paginated catalogue: `total` items split
+/// across `ceil(total / limit)` pages, recording which pages were asked for.
+private actor PagedStoreAPI: ExtensionStoreFetching {
+    private let total: Int
+    private var pages: [Int] = []
+
+    init(total: Int) { self.total = total }
+
+    func requestedPages() -> [Int] { pages }
+
+    func fetchExtensions(query: String, page: Int, limit: Int) async throws -> ExtensionsPageResponse {
+        pages.append(page)
+        let start = (page - 1) * limit
+        let end = min(start + limit, total)
+        let items = start < total
+            ? (start..<end).map {
+                ExtensionItem(id: "ext-\($0)", name: "Ext \($0)", description: "", author: "",
+                              icon: "", downloadCount: 0, downloadURL: "")
+            }
+            : []
+        let totalPages = max(1, Int(ceil(Double(total) / Double(limit))))
+        return ExtensionsPageResponse(extensions: items, page: page, totalPages: totalPages, totalCount: total)
     }
 }

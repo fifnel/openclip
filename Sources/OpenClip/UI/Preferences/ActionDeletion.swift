@@ -1,23 +1,21 @@
 // ActionDeletion.swift
 // OpenClip
 //
-// Deletes a custom action, an installed extension, or a custom group. Used by the Customize list's
-// context menu; mirrors the action editor's Delete Action and the row trash button it replaced:
-// a custom group ungroups, an extension uninstalls, and a custom action is removed from the store
-// and its generated single-action manifest package is deleted from disk so it cannot re-register.
+// Deletes a custom action, installed extension, or custom group from the Customize list's context
+// menu. A custom action also removes its generated manifest package so it cannot re-register.
 
 import Foundation
 import Core
 import KeyboardShortcuts
 
 enum ActionDeletion {
-    /// Whether the user may delete `action`: custom actions, installed extensions, and custom
-    /// groups qualify; built-ins and AI presets do not.
+    /// Custom actions, extensions, groups and AI presets are deletable; built-ins are not.
     static func canDelete(_ action: any Action) -> Bool {
         if action.chrome.rowStyle == .actionGroup { return true }
         switch action.chrome.source {
         case .custom, .extensionPkg: return true
-        case .builtin, .ai: return false
+        case .ai: return ActionIdentity.isAIPreset(action)
+        case .builtin: return false
         }
     }
 
@@ -41,15 +39,21 @@ enum ActionDeletion {
             ActionCoordinator.shared.deleteCustomAction(actionID: id)
             ActionCustomizationManager.shared.resetOverride(for: id)
             SettingsRouter.shared.clearConfigurationRequest(for: id)
-            // A custom action is also written as a single-action manifest package; remove it from
-            // disk so it does not reload on the next scan. A legacy store-only action has no
-            // package (404), which is not an error.
+            // Remove the manifest package so it does not reload on the next scan; a legacy store-only action has none (404 is fine).
             await removeManifest(actionID: id)
         case .extensionPkg:
-            // Uninstall by package identifier, not the action id: a package's command id need not
-            // carry the package prefix, and `uninstallExtension` matches on the identifier.
+            // Uninstall by package identifier: a command id need not carry the package prefix.
             await uninstall(actionID: ActionIdentity.extensionPackageID(of: action) ?? id)
-        case .builtin, .ai:
+        case .ai:
+            guard let preset = AIServiceManager.shared.preset(forActionID: id) else { return }
+            KeyboardShortcuts.reset(.actionHotkey(id))
+            ActionBindingStore.shared.setAlias(nil, for: id)
+            ActionCustomizationManager.shared.resetOverride(for: id)
+            ActionCoordinator.shared.setAIActionPlacement(actionIDs: [id], standalone: false)
+            AIServiceManager.shared.presets.removeAll { $0.id == preset.id }
+            AIActionSync.shared.sync()
+            SettingsRouter.shared.clearConfigurationRequest(for: id)
+        case .builtin:
             break
         }
     }
